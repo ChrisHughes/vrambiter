@@ -25,6 +25,7 @@ __all__ = [
     "NameInUse",
     "Holder",
     "VramUnavailable",
+    "HostRamUnavailable",
     "error_from_wire",
 ]
 
@@ -171,6 +172,7 @@ class VramUnavailable(VrambiterError):
 
     @classmethod
     def from_detail(cls, message: str, detail: dict[str, Any]) -> VramUnavailable:
+        """Rebuild from an ``error`` reply's ``detail`` (works for subclasses too)."""
         holders = []
         for raw in detail.get("holders") or []:
             try:
@@ -188,6 +190,24 @@ class VramUnavailable(VrambiterError):
             reason=str(detail.get("reason", "")),
             holders=holders,
         )
+
+
+class HostRamUnavailable(VramUnavailable):
+    """Like :class:`VramUnavailable`, but the missing resource is host RAM for a load.
+
+    A subclass on purpose: a satellite that handles "the arbiter cannot make room" catches both.
+    ``need`` and ``free`` are host bytes here, and ``holders`` is empty (the arbiter does not
+    attribute host memory).
+    """
+
+    code = "host_ram_unavailable"
+
+    def _default_message(self) -> str:
+        head = (
+            f"{self.model or 'request'} needs {format_bytes(self.need)} of host RAM to load; "
+            f"{format_bytes(max(self.free, 0))} is available"
+        )
+        return f"{head}: {self.reason}" if self.reason else head
 
 
 _BY_CODE: dict[str, type[VrambiterError]] = {
@@ -211,6 +231,8 @@ def error_from_wire(
     detail = detail or {}
     if code == VramUnavailable.code:
         return VramUnavailable.from_detail(message, detail)
+    if code == HostRamUnavailable.code:
+        return HostRamUnavailable.from_detail(message, detail)
     cls = _BY_CODE.get(code, ArbiterError)
     err = cls(message, detail=detail)
     if cls is ArbiterError and code != ArbiterError.code:
