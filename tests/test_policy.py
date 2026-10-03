@@ -298,6 +298,37 @@ def test_rule5_protected_model_counts_as_could_free_later():
     assert isinstance(decision, Wait) and decision.blockers == ("a/just-refused",)
 
 
+def test_rule5_evicting_model_or_returning_memory_counts_as_in_flight():
+    s = snap(evicting("a/e", 4), free=2, pending=0)
+    assert isinstance(plan(load(need=20), s), Wait)
+    s = snap(free=2, pending=4)  # e.g. a disconnected satellite's memory, still returning
+    decision = plan(load(need=20), s)
+    assert isinstance(decision, Wait) and decision.kind is WaitKind.EVICTING
+
+
+def test_queue_request_behind_waiting_requests_waits_instead_of_failing():
+    # vip evicts the hog and earmarks half of it, first earmarks the rest; second must queue,
+    # not fail, even though nothing is left for it in this pass.
+    s = snap(idle("h/hog", 24), free=0)
+    out = plan_queue(
+        [
+            load("a/vip", need=12, priority=5, seq=1),
+            load("a/first", need=12, seq=2),
+            load("a/second", need=12, seq=3),
+        ],
+        s,
+    )
+    assert out[0][1] == Evict(("h/hog",), G(24))
+    assert isinstance(out[1][1], Wait)
+    assert isinstance(out[2][1], Wait), out[2][1]
+
+
+def test_queue_never_fits_still_fails_behind_others():
+    s = snap(busy("h/hog", 20), free=4, total=24)
+    out = plan_queue([load("a/x", need=10, seq=1), load("a/huge", need=30, seq=2)], s)
+    assert isinstance(out[1][1], Fail)
+
+
 def test_rule5_busy_model_on_another_device_does_not_count():
     devices = {0: DeviceView(0, free=G(2), total=G(96)), 1: DeviceView(1, free=0, total=G(96))}
     s = snap(busy("b/busy", 30, device=1), devices=devices)

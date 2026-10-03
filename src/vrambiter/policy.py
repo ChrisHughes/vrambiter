@@ -29,9 +29,9 @@ THE RULES, in the order they are applied (docs/DESIGN.md, "Admission policy"):
    models on the same device whose priority is ``<=`` the requester's, ordered by
    ``(priority, last_used, id)``. Take the shortest prefix whose resident sizes cover the
    shortfall: **Evict**.
-5. If even every eligible victim is not enough: **Wait** if a busy or loading model on the device
-   could free memory later (or one that is only momentarily protected), else **Fail** naming
-   the holders.
+5. If even every eligible victim is not enough: **Wait** if something in flight on the device
+   could change that (a busy, loading or evicting model, one that is only momentarily
+   protected, or memory still returning), else **Fail** naming the holders.
 
 :func:`plan_queue` applies ``plan`` to the whole wait queue in priority-then-FIFO order, with each
 waiting request earmarking the memory it is counting on so later requests can only use what is
@@ -368,7 +368,7 @@ def plan(request: Request, snapshot: Snapshot) -> Decision:
             for m in snapshot.models
             if m.device == request.device
             and m.id != request.model_id
-            and (m.busy or m.phase is Phase.LOADING or (m.idle and m.protected))
+            and (m.busy or m.phase in (Phase.LOADING, Phase.EVICTING) or (m.idle and m.protected))
         )
     )
     if blockers:
@@ -377,6 +377,13 @@ def plan(request: Request, snapshot: Snapshot) -> Decision:
             f"needs {format_bytes(shortfall)} more than idle models can free; "
             f"waiting for {', '.join(blockers)}",
             blockers,
+        )
+    if dev.pending > 0:
+        # Memory is still coming back (an exiting process, a settling eviction) but not enough
+        # to admit outright: the picture changes once it lands, so this is not final.
+        return Wait(
+            WaitKind.EVICTING,
+            f"needs {format_bytes(shortfall)} more; {format_bytes(dev.pending)} still returning",
         )
     return Fail(
         need=request.need,
@@ -402,13 +409,17 @@ def plan_queue(requests: Sequence[Request], snapshot: Snapshot) -> list[tuple[Re
       small request past a large one stuck behind a busy model, without ever taking the large
       one's room;
     * a load left waiting at the host gate blocks later loads, so loads start in queue order;
-    * a second request for a model admitted earlier in the pass waits for that load.
+    * a second request for a model admitted earlier in the pass waits for that load;
+    * a request that would fail, but has requests ahead of it still waiting for room on the same
+      device, waits too: their admission changes the picture (a plan made against earmarked
+      room is not a reason to give up).
     """
     ordered = sorted(requests, key=lambda r: (-r.priority, r.seq))
     devices = dict(snapshot.devices)
     models = {m.id: m for m in snapshot.models}
     working = snapshot
     blocked_load: str | None = None
+    waiting_on: dict[int, str] = {}  # device -> first request still waiting for room there
     admitted: set[str] = set()
     out: list[tuple[Request, Decision]] = []
 
@@ -429,6 +440,17 @@ def plan_queue(requests: Sequence[Request], snapshot: Snapshot) -> list[tuple[Re
             )
         else:
             decision = plan(request, working)
+            ahead = waiting_on.get(request.device)
+            if (
+                isinstance(decision, Fail)
+                and not decision.host
+                and ahead is not None
+                and request.device in devices
+                and request.need <= devices[request.device].total - working.headroom
+            ):
+                # Requests ahead of this one on the device are waiting for room they have
+                # earmarked; once they are admitted the picture changes. Not final yet.
+                decision = Wait(WaitKind.QUEUED, f"queued behind {ahead}", (ahead,))
         out.append((original, decision))
 
         dev = devices.get(request.device)
@@ -451,6 +473,7 @@ def plan_queue(requests: Sequence[Request], snapshot: Snapshot) -> list[tuple[Re
                     host_reserved=working.host_reserved + request.host_peak,
                 )
         elif isinstance(decision, Evict) and dev is not None:
+            waiting_on.setdefault(request.device, request.model_id)
             for victim in decision.victims:
                 models[victim] = replace(models[victim], phase=Phase.EVICTING)
             dev = replace(dev, pending=dev.pending + decision.expected)
@@ -459,6 +482,7 @@ def plan_queue(requests: Sequence[Request], snapshot: Snapshot) -> list[tuple[Re
             if decision.kind in (WaitKind.LOAD_SLOT, WaitKind.HOST_RAM) and request.is_load:
                 blocked_load = request.model_id
             elif decision.kind in (WaitKind.EVICTING, WaitKind.BUSY) and dev is not None:
+                waiting_on.setdefault(request.device, request.model_id)
                 devices[request.device] = _earmark(dev, request.need, working.headroom)
         working = replace(working, devices=dict(devices), models=tuple(models.values()))
     return out

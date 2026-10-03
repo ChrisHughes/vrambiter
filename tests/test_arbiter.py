@@ -694,3 +694,31 @@ async def test_measurement_mismatch_is_logged_not_fatal(arb, gpu, caplog):
     await arb.quiesce()
     assert arb.registry.models["a/m"].measured_bytes == 9 * GiB
     assert "mismatch > 20%" in caplog.text
+
+
+async def test_baseline_learned_after_unload_settles(arb, gpu, clock):
+    """What a satellite holds with nothing resident (its CUDA context) is nobody's residency."""
+    a = Sat(arb, gpu, "a", 100)
+    gpu.allocate(100, "1GiB")  # CUDA context
+    await resident(arb, a, "m", 8)
+    assert arb.registry.models["a/m"].measured_bytes == 9 * GiB  # no baseline known yet
+    ctl = Sat(arb, gpu, "cli", 1, role="control")
+    ctl.request(p.EvictModel(model="a/m"))
+    [ev] = a.evicts()
+    a.evicted(ev, free=8)
+    await arb.quiesce()
+    assert arb.registry.satellites["a"].baseline == {0: GiB}
+    g = await granted(arb, a, a.acquire("m"))
+    a.load("m", 8)
+    a.request(p.Release(lease=g.lease))
+    await arb.quiesce()
+    assert arb.registry.models["a/m"].measured_bytes == 8 * GiB
+
+
+async def test_reconnecting_satellite_usage_is_not_mistaken_for_baseline(arb, gpu):
+    gpu.allocate(100, "8GiB")  # holds a model from before the arbiter restarted
+    a = Sat(arb, gpu, "a", 100)
+    await arb.quiesce()  # a planning pass between hello and register
+    a.request(p.Register(model="m", vram_peak=8 * GiB, state="resident", vram_bytes=8 * GiB))
+    await arb.quiesce()
+    assert arb.registry.models["a/m"].measured_bytes == 8 * GiB

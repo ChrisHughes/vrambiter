@@ -30,6 +30,7 @@ daemon = [
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
     "hypothesis>=6.100",
     "ruff>=0.6",
 ]
@@ -53,6 +54,8 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = ["gpu: needs a real NVIDIA GPU (deselect with -m 'not gpu')"]
 addopts = "-m 'not gpu'"
+# Threads, sockets and subprocesses: a hang must fail one test, not the whole run.
+timeout = 60
 
 [tool.ruff]
 line-length = 100

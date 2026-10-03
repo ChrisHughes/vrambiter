@@ -946,6 +946,11 @@ class ArbiterClient(_Base):
             with self._state_lock:
                 writer = self._writer
                 self._ready = self._link_up = False
+                pending, self._pending = self._pending, {}
+            # Callers blocked on a reply carry on standalone rather than hang forever.
+            for future in pending.values():
+                if not future.done():
+                    future.set_exception(_ConnectionLost())
             if writer is not None:
                 writer.close()
                 with contextlib.suppress(Exception):

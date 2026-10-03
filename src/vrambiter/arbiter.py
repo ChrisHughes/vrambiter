@@ -1174,8 +1174,11 @@ class Arbiter:
                 if usage is None:
                     continue
                 if all(m.phase is Phase.UNLOADED for m in shared):
-                    if not any(s.satellite == sat.name for s in self.registry.settling.values()):
-                        sat.baseline[device] = usage
+                    # Nothing resident: the baseline can only have shrunk (it is *learned* when
+                    # an unload settles, see _settle; a satellite that has just connected may
+                    # still be re-registering models it holds, so its usage proves nothing).
+                    if device in sat.baseline:
+                        sat.baseline[device] = min(sat.baseline[device], usage)
                     continue
                 for model_id, nbytes in attribute_usage(
                     shared, usage, sat.baseline.get(device, 0)
@@ -1200,6 +1203,7 @@ class Arbiter:
             if not settle.settled(gpu, now):
                 continue
             del self.registry.settling[key]
+            self._learn_baseline(settle, gpu)
             outstanding = settle.outstanding(gpu)
             if settle.expected and outstanding > (1 - SETTLE_FRACTION) * settle.expected:
                 sat = self.registry.satellites.get(settle.satellite)
@@ -1215,6 +1219,19 @@ class Arbiter:
                 )
         if self.registry.settling:
             self._schedule_settle_check()
+
+    def _learn_baseline(self, settle: Settle, gpu: GpuSnapshot) -> None:
+        """After an unload settles with nothing left resident, what the satellite still holds
+        is its floor (CUDA context, allocator pool): not any model's residency."""
+        sat = self.registry.satellites.get(settle.satellite)
+        if sat is None or not sat.connected:
+            return
+        on_dev = [m for m in self.registry.models_of(sat.name) if m.device == settle.device]
+        if any(m.phase is not Phase.UNLOADED or m.pids for m in on_dev):
+            return
+        usage = gpu.pid_usage(sat.all_pids(), settle.device)
+        if usage is not None:
+            sat.baseline[settle.device] = usage
 
     def _plan(self, snapshot: Snapshot, seq_limit: int) -> None:
         entries: dict[int, _Queued] = {}

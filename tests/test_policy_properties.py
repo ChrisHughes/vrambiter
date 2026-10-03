@@ -199,7 +199,7 @@ def test_fail_and_wait_busy_are_justified(case):
         for m in s.models
         if m.device == r.device
         and m.id != r.model_id
-        and (m.busy or m.phase is Phase.LOADING or (m.idle and m.protected))
+        and (m.busy or m.phase in (Phase.LOADING, Phase.EVICTING) or (m.idle and m.protected))
     ]
     eligible_total = sum(m.resident_bytes for m in eligible_victims(r, s))
     if isinstance(decision, Wait) and decision.kind is WaitKind.BUSY:
@@ -207,7 +207,8 @@ def test_fail_and_wait_busy_are_justified(case):
         assert eligible_total < _shortfall(r, s)
     if isinstance(decision, Fail) and not decision.host:
         never_fits = r.need > s.devices[r.device].total - s.headroom
-        assert never_fits or (not could_free_later and eligible_total < _shortfall(r, s))
+        nothing_in_flight = not could_free_later and s.devices[r.device].pending == 0
+        assert never_fits or (nothing_in_flight and eligible_total < _shortfall(r, s))
 
 
 @st.composite
