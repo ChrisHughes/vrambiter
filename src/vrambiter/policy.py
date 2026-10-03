@@ -31,7 +31,10 @@ THE RULES, in the order they are applied (docs/DESIGN.md, "Admission policy"):
    shortfall: **Evict**.
 5. If even every eligible victim is not enough: **Wait** if something in flight on the device
    could change that (a busy, loading or evicting model, one that is only momentarily
-   protected, or memory still returning), else **Fail** naming the holders.
+   protected, or memory still returning) *and* the most that could ever be made available to
+   this requester once it all finishes would cover the need; else **Fail** naming the holders.
+   (A busy model of higher priority never becomes evictable by a lower-priority request: waiting
+   on it alone would only end in a timeout.)
 
 :func:`plan_queue` applies ``plan`` to the whole wait queue in priority-then-FIFO order, with each
 waiting request earmarking the memory it is counting on so later requests can only use what is
@@ -362,28 +365,54 @@ def plan(request: Request, snapshot: Snapshot) -> Decision:
             return Evict(tuple(m.id for m in chosen), covered)
 
     # Rule 5.
-    blockers = tuple(
-        sorted(
-            m.id
-            for m in snapshot.models
-            if m.device == request.device
-            and m.id != request.model_id
-            and (m.busy or m.phase in (Phase.LOADING, Phase.EVICTING) or (m.idle and m.protected))
+    in_flight = [
+        m
+        for m in snapshot.models
+        if m.device == request.device
+        and m.id != request.model_id
+        and (m.busy or m.phase in (Phase.LOADING, Phase.EVICTING) or (m.idle and m.protected))
+    ]
+    blockers = tuple(sorted(m.id for m in in_flight))
+    if blockers or dev.pending > 0:
+        # Only wait for what could help *this* request. The most it could ever get without
+        # outside help: what is free, what is returning, every eligible idle model, every model
+        # in flight that will be evictable by it once idle, and every reservation (a busy model
+        # gives back its working headroom when its lease ends). A busy model of higher priority
+        # will never be evictable by this requester, so waiting on it alone would only end in a
+        # timeout.
+        could_join = sum(
+            m.resident_bytes
+            for m in in_flight
+            if m.priority <= request.priority
+            and not m.pinned
+            and not m.unresponsive
+            and m.phase is not Phase.EVICTING  # already counted in pending
         )
-    )
-    if blockers:
-        return Wait(
-            WaitKind.BUSY,
-            f"needs {format_bytes(shortfall)} more than idle models can free; "
-            f"waiting for {', '.join(blockers)}",
-            blockers,
-        )
-    if dev.pending > 0:
-        # Memory is still coming back (an exiting process, a settling eviction) but not enough
-        # to admit outright: the picture changes once it lands, so this is not final.
-        return Wait(
-            WaitKind.EVICTING,
-            f"needs {format_bytes(shortfall)} more; {format_bytes(dev.pending)} still returning",
+        potential = effective_free + dev.pending + covered + could_join + dev.reserved
+        if potential >= request.need:
+            if blockers:
+                return Wait(
+                    WaitKind.BUSY,
+                    f"needs {format_bytes(shortfall)} more than idle models can free; "
+                    f"waiting for {', '.join(blockers)}",
+                    blockers,
+                )
+            # Memory is still coming back (an exiting process, a settling eviction) but not
+            # enough to admit outright: the picture changes once it lands.
+            return Wait(
+                WaitKind.EVICTING,
+                f"needs {format_bytes(shortfall)} more; "
+                f"{format_bytes(dev.pending)} still returning",
+            )
+        return Fail(
+            need=request.need,
+            free=max(0, effective_free),
+            reason=(
+                f"even once everything in flight finishes, at most {format_bytes(potential)} "
+                "could be made available to it; the rest is held by models it may not evict "
+                "(pinned, higher priority, unresponsive) or by memory vrambiter does not manage"
+            ),
+            holders=holders(snapshot, request.device),
         )
     return Fail(
         need=request.need,

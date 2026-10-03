@@ -1207,8 +1207,8 @@ class Arbiter:
                 usage = gpu.pid_usage(pids - own_pids, device)
                 if usage is None:
                     continue
-                resident = [m for m in shared if m.phase is not Phase.UNLOADED]
-                if usage == 0 and resident:
+                resident = [m for m in shared if m.phase in (Phase.RESIDENT, Phase.EVICTING)]
+                if usage == 0 and any(m.phase is Phase.RESIDENT for m in resident):
                     # A process holding resident models holds at least a CUDA context. Zero means
                     # the driver cannot see it (a PID namespace, say): measurements are unknown,
                     # and declared sizes are used instead.
@@ -1222,7 +1222,15 @@ class Arbiter:
                             sat.pid,
                         )
                     continue
-                if not resident:
+                if any(m.phase is not Phase.RESIDENT for m in resident) or any(
+                    st.satellite == sat.name and st.device == device
+                    for st in self.registry.settling.values()
+                ):
+                    # An eviction in flight or memory still returning: the process total includes
+                    # bytes that are leaving, and splitting them among the models that stay would
+                    # overstate those models' residency.
+                    continue
+                if not resident and not any(m.phase is Phase.LOADING for m in shared):
                     # Nothing resident: the baseline can only have shrunk (it is *learned* when
                     # an unload settles, see _settle; a satellite that has just connected may
                     # still be re-registering models it holds, so its usage proves nothing).

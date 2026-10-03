@@ -234,7 +234,10 @@ def test_rule4_lower_priority_goes_first_regardless_of_lru():
 def test_rule4_never_evicts_higher_priority():
     s = snap(idle("a/vip", 50, priority=9), busy("a/b", 1), free=0)
     decision = plan(load(need=8, priority=1), s)
-    assert isinstance(decision, Wait) and decision.kind is WaitKind.BUSY
+    assert not isinstance(decision, Evict)
+    # ...and since the 1 GiB busy model is all that could ever join, it fails rather than waits.
+    assert isinstance(decision, Fail)
+    assert isinstance(plan(load(need=1, priority=1), s), Wait)
 
 
 def test_rule4_equal_priority_is_eligible():
@@ -299,11 +302,14 @@ def test_rule5_protected_model_counts_as_could_free_later():
 
 
 def test_rule5_evicting_model_or_returning_memory_counts_as_in_flight():
-    s = snap(evicting("a/e", 4), free=2, pending=0)
-    assert isinstance(plan(load(need=20), s), Wait)
-    s = snap(free=2, pending=4)  # e.g. a disconnected satellite's memory, still returning
-    decision = plan(load(need=20), s)
+    s = snap(evicting("a/e", 4), busy("b/x", 10), free=2, pending=4)
+    decision = plan(load(need=12), s)
+    assert isinstance(decision, Wait) and "a/e" in decision.blockers
+    # A load that was in flight when its satellite vanished: 5 GiB reserved and returning.
+    s = snap(free=7, reserved=5, pending=5)
+    decision = plan(load(need=8), s)
     assert isinstance(decision, Wait) and decision.kind is WaitKind.EVICTING
+    assert isinstance(plan(load(need=20), s), Fail)  # more than could ever come back
 
 
 def test_queue_request_behind_waiting_requests_waits_instead_of_failing():
@@ -327,6 +333,26 @@ def test_queue_never_fits_still_fails_behind_others():
     s = snap(busy("h/hog", 20), free=4, total=24)
     out = plan_queue([load("a/x", need=10, seq=1), load("a/huge", need=30, seq=2)], s)
     assert isinstance(out[1][1], Fail)
+
+
+def test_rule5_busy_higher_priority_model_cannot_help_so_fail_fast():
+    # The vip model is busy and will never be evictable by a priority-0 request; its working
+    # headroom (nothing reserved here) would not cover the need either. Waiting would only time out.
+    s = snap(busy("a/vip", 20, priority=5), free=2, total=24)
+    decision = plan(load(need=10, priority=0), s)
+    assert isinstance(decision, Fail) and "may not evict" in decision.reason
+
+
+def test_rule5_busy_higher_priority_model_whose_headroom_would_cover_means_wait():
+    # 8 GiB reserved as the busy vip model's working headroom comes back when its lease ends.
+    s = snap(busy("a/vip", 10, priority=5), free=10, reserved=8, total=24)
+    decision = plan(load(need=6, priority=0), s)
+    assert isinstance(decision, Wait) and decision.blockers == ("a/vip",)
+
+
+def test_rule5_busy_equal_priority_model_means_wait():
+    s = snap(busy("a/peer", 20, priority=0), free=2, total=24)
+    assert isinstance(plan(load(need=10, priority=0), s), Wait)
 
 
 def test_rule5_busy_model_on_another_device_does_not_count():

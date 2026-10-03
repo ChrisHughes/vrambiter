@@ -177,8 +177,13 @@ flight and the host peaks they reserved.
    Take the shortest prefix whose resident estimates cover the shortfall: **Evict(victims)**, then
    re-plan once the evictions are confirmed.
 5. If evicting every eligible victim still is not enough:
-   - if anything on the device could change that (a busy, loading, evicting or momentarily
-     protected model, or memory still returning): **Wait** (queue).
+   - if something on the device is in flight (a busy, loading, evicting or momentarily protected
+     model, or memory still returning) **and** the most that could ever be made available to
+     this requester once it all finishes would cover the need: **Wait** (queue). That bound is
+     free + pending + every eligible idle model + every in-flight model the requester will be
+     allowed to evict once it is idle + every reservation (a busy model gives back its working
+     headroom when its lease ends). A busy model of higher priority never becomes evictable by a
+     lower-priority request, so waiting on it alone would only end in a timeout.
    - else: **Fail** with `VramUnavailable(need, free, holders)`, a structured error that names
      what holds the memory: models with their state, pins and priorities, foreign processes, and
      whatever the driver counts as used that nobody claims.
@@ -490,8 +495,11 @@ the standard library; `integrations/torch.py` never imports torch itself. The da
   envelope (`peak - what the process already holds`) rather than the full peak. The draft reserved
   `vram_peak` only while loading, which left a model that grows during inference unprotected, and
   double-counted every byte a load had already allocated.
-- **"Could free memory later" includes evicting and protected models and settling memory**, and the
-  queue earmarks room in order. Found by the end-to-end tests: with only busy/loading models
+- **"Could free memory later" includes evicting and protected models and settling memory, but
+  only counts what could help this requester** (in-flight models it will be allowed to evict,
+  plus returning reservations), and the queue earmarks room in order. A randomised end-to-end
+  test showed low-priority requests waiting out their timeouts behind busy higher-priority models
+  that could never make room for them. Found by the end-to-end tests: with only busy/loading models
   counted, a third request behind two that had earmarked an in-flight eviction failed instead of
   waiting.
 - **Refusal cooldown**: after `evict_refused` a model is not chosen again for 2 s, so a refusal is

@@ -206,9 +206,33 @@ def test_fail_and_wait_busy_are_justified(case):
         assert could_free_later
         assert eligible_total < _shortfall(r, s)
     if isinstance(decision, Fail) and not decision.host:
-        never_fits = r.need > s.devices[r.device].total - s.headroom
-        nothing_in_flight = not could_free_later and s.devices[r.device].pending == 0
-        assert never_fits or (nothing_in_flight and eligible_total < _shortfall(r, s))
+        dev = s.devices[r.device]
+        never_fits = r.need > dev.total - s.headroom
+        nothing_in_flight = not could_free_later and dev.pending == 0
+        joinable = sum(
+            m.resident_bytes
+            for m in could_free_later
+            if m.priority <= r.priority
+            and not m.pinned
+            and not m.unresponsive
+            and m.phase is not Phase.EVICTING
+        )
+        potential = s.effective_free(r.device) + dev.pending + eligible_total + joinable
+        potential += dev.reserved
+        assert eligible_total < _shortfall(r, s) or never_fits
+        assert never_fits or nothing_in_flight or potential < r.need
+    if isinstance(decision, Wait) and decision.kind is WaitKind.BUSY:
+        dev = s.devices[r.device]
+        joinable = sum(
+            m.resident_bytes
+            for m in could_free_later
+            if m.priority <= r.priority
+            and not m.pinned
+            and not m.unresponsive
+            and m.phase is not Phase.EVICTING
+        )
+        potential = s.effective_free(r.device) + dev.pending + eligible_total + joinable
+        assert potential + dev.reserved >= r.need, "never wait on what cannot help"
 
 
 @st.composite
