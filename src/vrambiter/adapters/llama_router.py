@@ -11,6 +11,15 @@ models"):
 * ``POST /models/unload`` ``{"model": id}`` -> ``{"success": true}``
 * ``GET /health``
 
+DEAD INSTANCES. A child instance can die while the router still lists its model as ``loaded``;
+every request to it then fails with HTTP 500 ``proxy error: Could not establish connection``
+until the model is unloaded. So ``GET /models`` is never trusted alone: the adapter checks that
+the child processes it recorded at load time are alive and, when it has none recorded, probes
+``GET /props?model=<id>&autoload=false`` (answered by the child itself; a dead child gives the
+500 proxy error, an unloaded model a 400). A dead instance is reported to the arbiter (which
+marks the model unloaded and releases its accounting), the router entry is unloaded to clear the
+stale state, and the next lease loads it again.
+
 Run the router with ``--models-max 0`` (no router-side LRU: vrambiter decides what to evict) and
 ``--no-models-autoload`` (a chat request for an unloaded model fails instead of loading it behind
 the arbiter's back; consumers take a lease first, which loads it). Both are recommended, not
@@ -30,7 +39,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -81,6 +92,21 @@ class LlamaRouterClient:
             )
         return out
 
+    def probe(self, model: str) -> str:
+        """Ask the model's own instance something cheap: ``"alive"``, ``"dead"`` (listed as
+        loaded but its child is gone: 500 ``proxy error``), ``"unloaded"`` (400) or
+        ``"unknown"``. ``autoload=false`` so the probe itself never loads anything."""
+        query = urllib.parse.urlencode({"model": model, "autoload": "false"})
+        try:
+            request_json("GET", f"{self.url}/props?{query}", timeout=min(self.timeout, 5.0))
+        except HttpError as exc:
+            if exc.status == 500 and "proxy error" in str(exc):
+                return "dead"
+            if exc.status == 400:
+                return "unloaded"
+            return "unknown"
+        return "alive"
+
     def load(self, model: str) -> None:
         body = request_json(
             "POST", f"{self.url}/models/load", {"model": model}, timeout=self.timeout
@@ -120,6 +146,7 @@ class LlamaRouterDriver:
         load_timeout_s: float = 600.0,
         start_timeout_s: float = 120.0,
         poll_interval_s: float = 0.25,
+        probe_interval_s: float = 5.0,
         children: Callable[[int], set[int]] | None = None,
     ) -> None:
         self.client = client
@@ -130,7 +157,11 @@ class LlamaRouterDriver:
         self.load_timeout_s = load_timeout_s
         self.start_timeout_s = start_timeout_s
         self.poll_interval_s = poll_interval_s
+        self.probe_interval_s = probe_interval_s
         self._children = children or (lambda pid: process_tree(pid) - {pid})
+        #: The child processes each model's load created (empty when it was not ours to see).
+        self._instance_pids: dict[str, frozenset[int]] = {}
+        self._last_probe: dict[str, float] = {}
 
     # -- ModelDriver ------------------------------------------------------------------------------
 
@@ -147,24 +178,56 @@ class LlamaRouterDriver:
 
     async def force_stop(self) -> None:
         if self.process is not None:
-            await self.process.stop()
+            await self.process.restart_now()
 
-    async def poll(self) -> dict[str, bool] | None:
-        """Which declared models the router has loaded, for changes made behind our back."""
+    async def poll(self) -> dict[str, str] | None:
+        """``{model: "loaded" | "unloaded" | "dead"}`` for the declared models: changes the
+        router made behind our back, and instances that died while still listed as loaded."""
         if self.process is not None and not self.process.running:
             return None
+        return await asyncio.to_thread(self._poll_blocking)
+
+    def _poll_blocking(self) -> dict[str, str] | None:
         try:
-            listed = await asyncio.to_thread(self.client.models)
+            listed = self.client.models()
         except HttpError as exc:
             log.debug("polling %s failed: %s", self.client.url, exc)
             return None
-        states: dict[str, bool] = {}
+        states: dict[str, str] = {}
+        # Only declared models: the router also lists cache entries and duplicates we ignore.
         for name, router_id in self.models.items():
             entry = listed.get(router_id)
             if entry is None or entry.status in ("loading", "downloading"):
                 continue
-            states[name] = entry.status == "loaded"
+            if entry.status != "loaded":
+                states[name] = "unloaded"
+                self._instance_pids.pop(name, None)
+            elif self._instance_dead(name, router_id, periodic=True):
+                log.warning("llama-router: %s is listed as loaded but its instance is dead", name)
+                self._clear_dead(name, router_id)
+                states[name] = "dead"
+            else:
+                states[name] = "loaded"
         return states
+
+    def _instance_dead(self, name: str, router_id: str, *, periodic: bool = False) -> bool:
+        """Never trust ``GET /models`` alone: a crashed child stays listed as loaded."""
+        pids = self._instance_pids.get(name)
+        if pids:
+            return not any(_pid_alive(pid) for pid in pids)
+        now = time.monotonic()
+        if periodic and now - self._last_probe.get(name, 0.0) < self.probe_interval_s:
+            return False
+        self._last_probe[name] = now
+        return self.client.probe(router_id) == "dead"
+
+    def _clear_dead(self, name: str, router_id: str) -> None:
+        """Unload the stale entry so the router will start a fresh instance next time."""
+        self._instance_pids.pop(name, None)
+        try:
+            self.client.unload(router_id)
+        except HttpError as exc:
+            log.debug("unloading dead %s failed: %s", router_id, exc)
 
     # -- blocking work ----------------------------------------------------------------------------
 
@@ -188,6 +251,13 @@ class LlamaRouterDriver:
         current = self.client.models().get(router_id)
         if current is None:
             raise RuntimeError(f"llama-server at {self.client.url} has no model {router_id!r}")
+        if current.status == "loaded" and self._instance_dead(model, router_id):
+            log.warning("llama-router: %s listed as loaded but dead; reloading it", router_id)
+            self._clear_dead(model, router_id)
+            self._wait_for(router_id, want="unloaded")
+            before_children = self._router_children()
+            free_before = self.gpu.mem_info(device)[0]
+            current = self.client.models().get(router_id) or current
         if current.status != "loaded":
             self.client.load(router_id)
             self._wait_for(router_id, want="loaded")
@@ -202,12 +272,17 @@ class LlamaRouterDriver:
                 vram = sum(usage.get(pid, 0) for pid in pids)
         if vram is None:
             vram = max(0, free_before - self.gpu.mem_info(device)[0]) or None
+        if pids:
+            self._instance_pids[model] = pids
+        else:
+            pids = self._instance_pids.get(model, frozenset())  # already loaded by us earlier
         log.info("llama-router loaded %s (%s bytes, pids %s)", router_id, vram, sorted(pids))
         return LoadResult(vram_bytes=vram, pids=pids)
 
     def _unload_blocking(self, model: str) -> None:
         router_id = self.models.get(model, model)
         current = self.client.models().get(router_id)
+        self._instance_pids.pop(model, None)
         if current is None or current.status == "unloaded":
             return
         self.client.unload(router_id)
@@ -232,3 +307,18 @@ class LlamaRouterDriver:
             if time.monotonic() > deadline:
                 raise TimeoutError(f"{router_id} not {want} after {self.load_timeout_s:.0f}s")
             time.sleep(self.poll_interval_s)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:  # a zombie answers kill(0) but is dead; ask the process table when psutil is around
+        import psutil
+
+        return bool(psutil.Process(pid).status() != psutil.STATUS_ZOMBIE)
+    except Exception:
+        return True

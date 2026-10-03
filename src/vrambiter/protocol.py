@@ -154,9 +154,10 @@ class Hello(Message):
 class Register(Message):
     """Declare a model this satellite can load. Sizes are bytes.
 
-    ``state``/``vram_bytes``/``leases`` describe the model as the satellite currently holds it, so a
-    satellite re-registering after an arbiter restart is believed rather than reset: a model that
-    is resident and leased stays resident and busy.
+    ``state`` (``unloaded``/``loading``/``resident``), ``vram_bytes`` and ``leases`` describe the
+    model as the satellite currently holds it, so a satellite re-registering after an arbiter
+    restart is believed rather than reset: a model that is resident and leased stays resident and
+    busy, and a load still running keeps its reservation.
     """
 
     type: ClassVar[str] = "register"

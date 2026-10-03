@@ -155,8 +155,10 @@ class ModelDriver(Protocol):
 class PollingDriver(ModelDriver, Protocol):
     """A driver that can also report state changes it did not cause (llama-router)."""
 
-    async def poll(self) -> dict[str, bool] | None:
-        """``{model name: loaded?}`` for models whose state it knows, or ``None`` if unreachable."""
+    async def poll(self) -> dict[str, str] | None:
+        """``{model name: "loaded" | "unloaded" | "dead"}`` for the models whose state it knows,
+        or ``None`` if the server is unreachable. ``"dead"`` means the server still lists the model
+        as loaded but its instance is gone (llama-server keeps a crashed child listed)."""
         ...
 
 
@@ -324,13 +326,24 @@ class Arbiter:
         self._bump()
         self.kick()
 
-    def external_model_state(self, satellite: str, model_name: str, loaded: bool) -> None:
-        """A driver noticed a model change state behind the arbiter's back (e.g. llama-server
-        autoloaded it for a request, or unloaded it on its own idle timer)."""
+    def external_model_state(self, satellite: str, model_name: str, state: str) -> None:
+        """A driver noticed a model change state behind the arbiter's back: llama-server
+        autoloaded it for a request (``"loaded"``), unloaded it on its own idle timer
+        (``"unloaded"``), or lost the instance while still listing it (``"dead"``)."""
         model = self.registry.models.get(f"{satellite}/{model_name}")
-        if model is None or model.phase in (Phase.LOADING, Phase.EVICTING):
+        if model is None or model.phase is Phase.LOADING:
             return
         now = self.clock.now()
+        if state == "dead":
+            if model.phase in (Phase.RESIDENT, Phase.EVICTING):
+                log.warning("%s: its instance died; marking it unloaded", model.id)
+                self._model_gone(model, now, reason="instance died")
+                self._bump()
+                self.kick()
+            return
+        if model.phase is Phase.EVICTING:
+            return
+        loaded = state == "loaded"
         if loaded and model.phase is Phase.UNLOADED:
             log.warning("%s was loaded outside the arbiter; tracking it as resident", model.id)
             model.phase = Phase.RESIDENT
@@ -434,8 +447,10 @@ class Arbiter:
             raise RegistrationError(
                 f"no GPU {msg.device} (devices: {sorted(self._last.gpu.total)})"
             )
-        if msg.state not in ("unloaded", "resident"):
-            raise RegistrationError(f"state must be 'unloaded' or 'resident', not {msg.state!r}")
+        if msg.state not in ("unloaded", "resident", "loading"):
+            raise RegistrationError(
+                f"state must be 'unloaded', 'loading' or 'resident', not {msg.state!r}"
+            )
 
         now = self.clock.now()
         model_id = f"{state.name}/{msg.model}"
@@ -456,7 +471,19 @@ class Arbiter:
         model.profile_pin = self._profile_matches(model_id)
 
         adopted: list[str] = []
-        if fresh and msg.state == "resident":
+        if fresh:
+            model.unresponsive = False
+        if fresh and msg.state == "loading":
+            # A load granted on a previous connection is still running in the satellite: account
+            # for it (reservation, load slot) and adopt its lease as the loader's.
+            model.phase = Phase.LOADING
+            model.load_started_at = now
+            for i in range(msg.leases):
+                action = "load" if i == 0 else "ready"
+                lease = self.registry.add_lease(model, state.name, state.conn.id, now, action)
+                adopted.append(lease.id)
+            log.info("%s re-registered while loading", model_id)
+        elif fresh and msg.state == "resident":
             # Re-registration after a reconnect or an arbiter restart: believe the satellite.
             # Whatever we expected back from its previous connection is not coming: it is here.
             for key in [k for k, v in self.registry.settling.items() if v.satellite == state.name]:
@@ -844,6 +871,10 @@ class Arbiter:
     def _finish_evict(self, model: ModelRecord) -> None:
         self._cancel_evict_timer(model)
         now = self.clock.now()
+        # A late `evicted` after an evict timeout can find leases granted meanwhile: the model is
+        # gone regardless, so they end (the owner's client re-acquires and reloads, admitted).
+        for lease_id in list(model.leases):
+            self._end_lease(lease_id, now)
         expected = model.resident_estimate()
         sat = self.registry.satellites.get(model.satellite)
         self._add_settle(
@@ -882,7 +913,10 @@ class Arbiter:
             and (only_model or self.settings.kill_on_evict_timeout)
         ):
             log.warning("evicting %s timed out; stopping its process", model.id)
-            self._spawn(stop(), f"vrambiter-kill-{model.satellite}")
+            self._spawn(
+                self._force_stop_then_check(model, evict_id, stop),
+                f"vrambiter-kill-{model.satellite}",
+            )
             return
         log.warning(
             "evicting %s timed out after %.0fs; marking it unresponsive",
@@ -892,6 +926,22 @@ class Arbiter:
         model.phase = Phase.RESIDENT
         model.unresponsive = True  # keep evict_id: a late `evicted` is still accepted
         self.kick()
+
+    async def _force_stop_then_check(
+        self, model: ModelRecord, evict_id: str, stop: Callable[[], Awaitable[object]]
+    ) -> None:
+        try:
+            await stop()
+        except Exception:
+            log.exception("stopping %s failed", model.satellite)
+        # Normally the exit already marked it unloaded. If the stop did nothing (a process we
+        # did not start) it must not stay EVICTING forever, counted as memory on its way back.
+        if model.phase is Phase.EVICTING and model.evict_id == evict_id:
+            log.warning("%s is still there after the stop; marking it unresponsive", model.id)
+            model.phase = Phase.RESIDENT
+            model.unresponsive = True
+            self._bump()
+            self.kick()
 
     def _model_gone(
         self, model: ModelRecord, now: float, reason: str, *, settle: bool = True
@@ -939,6 +989,7 @@ class Arbiter:
             self._end_lease(lease_id, now)
         model.phase = Phase.UNLOADED
         model.evict_id = None
+        model.unresponsive = False
         model.load_started_at = None
         model.pids = frozenset()
         # Queued requests for a cooperative model whose owner left cannot be served.
@@ -1043,11 +1094,18 @@ class Arbiter:
             self.kick()
             return
         if model.phase is not Phase.LOADING:
-            return  # the process died meanwhile; satellite_process_exited handled it
+            # The process died meanwhile (satellite_process_exited ended the lease): the request
+            # was already dequeued, so it must be answered here or it hangs.
+            self._reply_error(
+                q,
+                ArbiterError(f"{model.id} went away while loading", detail={"code": "load_failed"}),
+            )
+            return
         model.phase = Phase.RESIDENT
         model.load_started_at = None
         model.reported_bytes = result.vram_bytes
         model.measured_bytes = None
+        model.unresponsive = False
         model.pids = result.pids
         model.last_used = self.clock.now()
         lease = self.registry.leases.get(lease_id)
@@ -1098,8 +1156,9 @@ class Arbiter:
             self._spawn(self._run_driver_poll(name, poll), f"vrambiter-poll-{name}")
 
     async def _run_driver_poll(
-        self, name: str, poll: Callable[[], Awaitable[dict[str, bool] | None]]
+        self, name: str, poll: Callable[[], Awaitable[dict[str, str] | None]]
     ) -> None:
+        versions = {m.name: m.version for m in self.registry.models_of(name)}
         try:
             states = await poll()
         except Exception:
@@ -1107,8 +1166,11 @@ class Arbiter:
             return
         finally:
             self._polling.discard(name)
-        for model_name, loaded in (states or {}).items():
-            self.external_model_state(name, model_name, loaded)
+        for model_name, state in (states or {}).items():
+            model = self.registry.models.get(f"{name}/{model_name}")
+            if model is None or model.version != versions.get(model_name):
+                continue  # it changed while the poll was in flight: the listing is stale
+            self.external_model_state(name, model_name, state)
 
     def _roots(self) -> dict[str, frozenset[int]]:
         roots: dict[str, frozenset[int]] = {}
@@ -1332,6 +1394,9 @@ class Arbiter:
             q = entries[req.seq]
             model = self.registry.models[q.model_id]
             if isinstance(decision, Admit):
+                expected = Phase.UNLOADED if req.is_load else Phase.RESIDENT
+                if model.phase is not expected:
+                    continue  # changed under the plan (chosen as a victim): next pass decides
                 self._grant(q, model, "load" if req.is_load else "ready")
             elif isinstance(decision, Evict):
                 self._set_reason(q, f"evicting {', '.join(decision.victims)}", decision.victims)
@@ -1341,7 +1406,10 @@ class Arbiter:
                         self._start_evict(victim, reason=f"making room for {model.id}")
             elif isinstance(decision, Wait):
                 self._set_reason(q, decision.reason, decision.blockers)
-                if not q.wait and decision.kind not in (WaitKind.EVICTING, WaitKind.QUEUED):
+                in_progress = decision.kind is WaitKind.EVICTING or (
+                    decision.kind is WaitKind.QUEUED and decision.blockers == (model.id,)
+                )
+                if not q.wait and not in_progress:
                     self._dequeue(q)
                     self._reply_error(q, self._unavailable(model, f"would wait: {decision.reason}"))
             elif isinstance(decision, Fail):

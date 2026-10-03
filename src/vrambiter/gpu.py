@@ -94,13 +94,27 @@ class GpuSnapshot:
 
 
 def take_snapshot(backend: GpuBackend) -> GpuSnapshot:
-    """Read every device once. Blocking: call it from a worker thread, never the event loop."""
+    """Read every device once. Blocking: call it from a worker thread, never the event loop.
+
+    Free memory and per-process usage cannot be read atomically, and an allocation landing
+    between the two reads would count as free *and* (by shrinking a loading process's
+    reservation) as already used: over-admission by its size. So usage is read before and after
+    the free reading and each process gets the smaller figure, which is conservative whichever
+    way memory moved in between.
+    """
     free: dict[int, int] = {}
     total: dict[int, int] = {}
     usage: dict[int, dict[int, int] | None] = {}
     for device in backend.devices():
+        before = backend.process_usage(device)
         free[device], total[device] = backend.mem_info(device)
-        usage[device] = backend.process_usage(device)
+        after = backend.process_usage(device)
+        if before is None or after is None:
+            usage[device] = None
+        else:
+            usage[device] = {
+                pid: min(before.get(pid, 0), after.get(pid, 0)) for pid in before.keys() | after
+            }
     return GpuSnapshot(free=free, total=total, usage=usage)
 
 
@@ -341,6 +355,8 @@ class FakeGpu:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Whether ``pid`` is a live process. A zombie is not: the driver frees a process's memory
+    when it exits, not when its parent gets round to reaping it."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -349,7 +365,14 @@ def _pid_alive(pid: int) -> bool:
         return True
     except OSError as exc:  # pragma: no cover
         return exc.errno != errno.ESRCH
-    return True
+    try:
+        import psutil
+    except ImportError:  # pragma: no cover - psutil is in the daemon extra
+        return True
+    try:
+        return bool(psutil.Process(pid).status() != psutil.STATUS_ZOMBIE)
+    except psutil.Error:
+        return False
 
 
 def default_gpu_backend() -> GpuBackend:

@@ -128,3 +128,25 @@ def test_nvml_backend_reports_unknown_usage(monkeypatch):
     assert NvmlBackend().process_usage(0) is None
     _fake_pynvml(monkeypatch, compute=[], graphics=[])
     assert NvmlBackend().process_usage(0) == {}
+
+
+def test_snapshot_never_counts_an_allocation_as_free_and_used():
+    """An allocation landing between the free and per-process reads must not inflate free."""
+
+    class Racy(FakeGpu):
+        def __init__(self):
+            super().__init__("24GiB")
+            self.reads = 0
+
+        def process_usage(self, device):
+            self.reads += 1
+            if self.reads == 2:  # after mem_info, before the second usage read
+                self.allocate(7, "10GiB")
+            return super().process_usage(device)
+
+    gpu = Racy()
+    snap = take_snapshot(gpu)
+    # free was read before the allocation (24 GiB); usage must not show it as held yet, or a
+    # loading process's reservation would shrink by memory still counted as free.
+    assert snap.free[0] == 24 * GiB
+    assert snap.pid_usage({7}, 0) == 0

@@ -315,3 +315,42 @@ async def test_simulated_gpu_makes_fake_mode_meaningful(sock_path):
         for c in clients:
             c.close()
         await daemon.stop()
+
+
+async def test_llama_router_dead_instance_is_unloaded_and_reloaded(make, gpu):
+    port = free_port()
+    router_cfg = {"models": {"gemma": 8 * GiB}, "load_delay": 0.05}
+    daemon = await make(
+        [
+            {
+                "name": "llama",
+                "adapter": "llama-router",
+                "url": f"http://127.0.0.1:{port}",
+                "command": [
+                    PY,
+                    os.path.join(FAKES, "llama_router.py"),
+                    str(gpu._path),
+                    str(port),
+                    json.dumps(router_cfg),
+                ],
+                "model": [{"name": "gemma", "vram_peak": "9GiB"}],
+            },
+        ]
+    )
+    await wait_for(lambda: daemon.processes["llama"].running, timeout=10)
+    app = await make.client("chat", 501)
+    lease = await asyncio.to_thread(app.acquire, "llama/gemma")
+    gemma = daemon.arbiter.registry.models["llama/gemma"]
+    (child,) = gemma.pids
+    os.kill(child, signal.SIGKILL)  # the instance crashes; the router keeps listing it loaded
+    # The poll notices within a second; the model is unloaded even though it is leased.
+    await wait_for(lambda: models(daemon)["llama/gemma"] == "unloaded", timeout=10)
+    assert not gemma.leases
+    lease.release()  # releasing a lease the arbiter already ended is harmless
+
+    def chat():
+        with app.lease("llama/gemma") as again:
+            return again.action
+
+    assert await asyncio.to_thread(chat) == "ready"
+    assert gemma.pids and child not in gemma.pids

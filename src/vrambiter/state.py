@@ -86,6 +86,14 @@ class ModelRecord:
     protected_until: float = 0.0
     load_started_at: float | None = None
     mismatch_logged: bool = False
+    #: Bumped on every phase change, so results computed before a transition (a driver's poll
+    #: of the server's own state, say) can be recognised as stale and dropped.
+    version: int = 0
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "phase" and getattr(self, "phase", None) is not value:
+            object.__setattr__(self, "version", getattr(self, "version", 0) + 1)
+        object.__setattr__(self, name, value)
 
     @property
     def id(self) -> str:
@@ -301,13 +309,17 @@ def request_for(model: ModelRecord, *, seq: int = 0) -> Request | None:
     return None
 
 
-def satellite_reservation(models: Iterable[ModelRecord], usage: int | None) -> int:
+def satellite_reservation(
+    models: Iterable[ModelRecord], usage: int | None, baseline: int = 0
+) -> int:
     """Bytes to reserve for one satellite process on one device (see the module docstring).
 
     ``models`` are that satellite's models on that device; ``usage`` is what its processes hold
-    there now, or ``None`` if the driver cannot say.
+    there now, or ``None`` if the driver cannot say. ``baseline`` is the process's floor (CUDA
+    context, allocator pool) when known: it is in ``usage`` but in no model's estimate, so it
+    belongs in the envelope too, or every load would be under-reserved by it.
     """
-    envelope = 0
+    envelope = baseline
     outstanding = 0  # the most that could still be needed: full peaks of loads, busy headroom
     for m in models:
         if m.phase is Phase.LOADING:
@@ -382,7 +394,8 @@ def build_snapshot(
             if shared:
                 own_pids = frozenset().union(*(m.pids for m in own)) if own else frozenset()
                 usage = gpu.pid_usage(pids - own_pids, device) if pids else None
-                reserved += satellite_reservation(shared, usage)
+                baseline = sat.baseline.get(device, 0) if sat else 0
+                reserved += satellite_reservation(shared, usage, baseline)
             pending += sum(m.resident_estimate() for m in models if m.phase is Phase.EVICTING)
         for settle in registry.settling.values():
             if settle.device == device:

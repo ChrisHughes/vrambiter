@@ -175,6 +175,13 @@ Two flags matter:
 Do not use `load-on-startup` in the preset; use `vrambiter warm llama/MODEL` or a consumer lease.
 `--sleep-idle-seconds` is compatible: a sleeping model is tracked as unloaded.
 
+**Crashed instances.** A model's child process can die while the router keeps listing the model
+as `loaded`; requests to it then get HTTP 500 `proxy error: Could not establish connection`. The
+adapter checks the child's pid every poll (and probes `GET /props?model=...&autoload=false` for
+models it did not load itself), so within a poll or a few seconds the arbiter marks the model
+unloaded, clears the router's stale entry, and the next lease loads a fresh instance. A consumer
+that sees that 500 should treat it as transient: release the lease and take a new one.
+
 ### Configure vrambiter
 
 ```toml
@@ -195,10 +202,11 @@ command = ["/opt/llama.cpp/build/bin/llama-server", "--models-preset", "/etc/lla
   vram_peak = "9GiB"
 ```
 
-Only declared models are managed; others the router lists are ignored (their memory still counts
-against free memory). `vram_peak` for a GGUF model is roughly the file size plus the KV cache at
-the configured context (`c`), plus compute buffers: load it once, read `vrambiter status`, and round
-up. Let the arbiter run the router (`command`): that is what lets it attribute each model's child
+Only declared models are managed; others the router lists (cache entries, duplicates) are ignored
+(their memory still counts against free memory). `vram_peak` for a GGUF model is roughly the file
+size plus the KV cache at the configured context (`c`), plus compute buffers: load it once, read
+`vrambiter status`, and round up. For scale, measured child usage on a real box: Gemma 4 26B Q8
+31.7 GB, Qwen3.6-35B Q8 38.9 GB; loads took 21-33 s, unloads returned the memory in 1-2 s. Let the arbiter run the router (`command`): that is what lets it attribute each model's child
 process, so measurements are exact. With `url` only, the arbiter cannot know the router's pid and
 falls back to the drop in free memory across each load.
 
@@ -214,13 +222,18 @@ with arb.lease("llama/gemma-4-26b", timeout=300):
 ```
 
 The lease loads the model if it is not resident (waiting for room as usual) and keeps it busy until
-the reply is done. Without a running arbiter the lease is a no-op and the request goes straight to
+the reply is done. With `--no-models-autoload`, a request without a lease for an unloaded model
+gets HTTP 400: take the lease first. Without a running arbiter the lease is a no-op and the request goes straight to
 the router. For tools that cannot take a lease, `vrambiter warm llama/gemma-4-26b` (or a profile
 that pins it) makes it resident ahead of time.
 
 ### A single-model `llama-server`
 
 A plain `llama-server -m model.gguf` is a black box: one process, one model (next section).
+
+Launch the router directly (or through `vrambiter`), not under a wrapper that holds a lock file
+descriptor: children inherit descriptors from their parent, and a model child holding a `flock`
+keeps the lock forever. vrambiter itself spawns managed processes with no inherited descriptors.
 
 ## 3. Black boxes
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 
 import pytest
@@ -76,9 +77,9 @@ async def test_load_measures_the_child_instance_and_unload_removes_it(router, gp
     assert gpu.usage(child) == 6 * GiB
     assert client.models()["gemma"].status == "loaded"
     assert driver.root_pids() == {proc.pid}
-    # Loading what is already loaded is a no-op that still answers.
+    # Loading what is already loaded is a no-op that still answers (with the same instance).
     again = await driver.load("gemma-4")
-    assert again.pids == frozenset()
+    assert again.pids == result.pids
     await driver.unload("gemma-4")
     assert client.models()["gemma"].status == "unloaded"
     await wait_for(lambda: child not in gpu.process_usage(0))
@@ -95,11 +96,52 @@ async def test_poll_reports_external_changes(router):
     proc, client, driver = router
     assert await driver.poll() is None  # router not running yet
     await driver._ensure_running()
-    assert await driver.poll() == {"gemma-4": False, "qwen": False, "broken": False}
+    assert await driver.poll() == {"gemma-4": "unloaded", "qwen": "unloaded", "broken": "unloaded"}
     client.load("qwen")  # behind the arbiter's back (a request with autoload, say)
     await wait_for(lambda: client.models()["qwen"].status == "loaded")
     states = await driver.poll()
-    assert states["qwen"] is True
+    assert states["qwen"] == "loaded"
+    assert client.probe("qwen") == "alive" and client.probe("gemma") == "unloaded"
+
+
+async def test_dead_instance_listed_as_loaded_is_detected_and_reloaded(router, gpu):
+    proc, client, driver = router
+    first = await driver.load("gemma-4")
+    (child,) = first.pids
+    os.kill(child, signal.SIGKILL)  # the child crashes; the router still says "loaded"
+    await wait_for(lambda: child not in gpu.process_usage(0))
+    assert client.models()["gemma"].status == "loaded"
+    assert client.probe("gemma") == "dead"
+    assert (await driver.poll())["gemma-4"] == "dead"
+    # The stale entry was unloaded, so the next load starts a fresh instance.
+    await wait_for(lambda: client.models()["gemma"].status == "unloaded")
+    second = await driver.load("gemma-4")
+    assert second.pids and second.pids != first.pids
+    assert second.vram_bytes == 6 * GiB
+
+
+async def test_dead_instance_without_recorded_pids_is_found_by_probe(router, gpu):
+    proc, client, driver = router
+    await driver._ensure_running()
+    client.load("qwen")  # loaded behind our back: no pids recorded
+    await wait_for(lambda: client.models()["qwen"].status == "loaded")
+    import psutil
+
+    (child,) = [c.pid for c in psutil.Process(proc.pid).children()]
+    os.kill(child, signal.SIGKILL)
+    await wait_for(lambda: client.probe("qwen") == "dead")
+    driver.probe_interval_s = 0
+    assert (await driver.poll())["qwen"] == "dead"
+
+
+async def test_load_of_a_dead_listed_model_reloads_it(router, gpu):
+    proc, client, driver = router
+    first = await driver.load("qwen")
+    (child,) = first.pids
+    os.kill(child, signal.SIGKILL)
+    await wait_for(lambda: client.probe("qwen") == "dead")
+    second = await driver.load("qwen")  # no poll in between: load itself must notice
+    assert second.pids != first.pids and client.probe("qwen") == "alive"
 
 
 async def test_fallback_measurement_uses_free_memory_delta(gpu):

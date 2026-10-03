@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 
 CHILD = (
     "import os, signal, sys, time\n"
@@ -104,11 +105,42 @@ def main() -> None:
             self.end_headers()
             self.wfile.write(data)
 
+        def _text(self, code: int, body: str) -> None:
+            data = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self) -> None:
             router.requests.append(("GET", self.path))
-            if self.path == "/health":
+            url = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(url.query)
+            if url.path == "/health":
                 self._json(200, {"status": "ok"})
-            elif self.path.startswith("/models"):
+            elif url.path == "/props" and "model" in query:
+                # Proxied to the model's child, as the real router does. Like the real one, a
+                # child that died while listed as loaded gives 500 "proxy error" (plain text).
+                model = query["model"][0]
+                status = router.status.get(model, {}).get("value")
+                if status != "loaded":
+                    self._json(
+                        400,
+                        {
+                            "error": {
+                                "code": 400,
+                                "message": "model is not loaded",
+                                "type": "invalid_request_error",
+                            }
+                        },
+                    )
+                    return
+                child = router.children.get(model)
+                if child is None or child.poll() is not None:
+                    self._text(500, "proxy error: Could not establish connection")
+                    return
+                self._json(200, {"model_path": f"/models/{model}.gguf"})
+            elif url.path.startswith("/models"):
                 self._json(200, router.listing())
             else:
                 self._json(404, {"error": {"code": 404, "message": "not found"}})

@@ -450,18 +450,27 @@ def plan_queue(requests: Sequence[Request], snapshot: Snapshot) -> list[tuple[Re
     blocked_load: str | None = None
     waiting_on: dict[int, str] = {}  # device -> first request still waiting for room there
     admitted: set[str] = set()
+    planned: set[str] = set()  # models with an Evict/Wait decision in this pass
     out: list[tuple[Request, Decision]] = []
 
     for original in ordered:
         request = original
         current = models.get(request.model_id)
+        start = snapshot.model(request.model_id)
         if not request.is_load and current is not None and current.busy:
             # Another lease on a model that is already busy (perhaps made busy earlier in this
             # pass): its working headroom is already reserved.
             request = replace(request, need=0)
-        if request.model_id in admitted:
+        if request.model_id in admitted or request.model_id in planned:
+            # This pass already decided for this model (admitted its load, or is evicting or
+            # waiting on its behalf): one decision per model, not one eviction per request.
             decision: Decision = Wait(
                 WaitKind.QUEUED, f"{request.model_id} is being admitted", (request.model_id,)
+            )
+        elif current is not None and start is not None and current.phase is not start.phase:
+            # Chosen as a victim earlier in this pass: it is about to be evicted, not leased.
+            decision = Wait(
+                WaitKind.QUEUED, f"{request.model_id} is being evicted", (request.model_id,)
             )
         elif request.is_load and blocked_load is not None:
             decision = Wait(
@@ -502,6 +511,7 @@ def plan_queue(requests: Sequence[Request], snapshot: Snapshot) -> list[tuple[Re
                     host_reserved=working.host_reserved + request.host_peak,
                 )
         elif isinstance(decision, Evict) and dev is not None:
+            planned.add(request.model_id)
             waiting_on.setdefault(request.device, request.model_id)
             for victim in decision.victims:
                 models[victim] = replace(models[victim], phase=Phase.EVICTING)
@@ -511,6 +521,7 @@ def plan_queue(requests: Sequence[Request], snapshot: Snapshot) -> list[tuple[Re
             if decision.kind in (WaitKind.LOAD_SLOT, WaitKind.HOST_RAM) and request.is_load:
                 blocked_load = request.model_id
             elif decision.kind in (WaitKind.EVICTING, WaitKind.BUSY) and dev is not None:
+                planned.add(request.model_id)
                 waiting_on.setdefault(request.device, request.model_id)
                 devices[request.device] = _earmark(dev, request.need, working.headroom)
         working = replace(working, devices=dict(devices), models=tuple(models.values()))

@@ -149,3 +149,42 @@ async def test_black_box_not_ready_in_time_is_stopped(gpu_file):
     with pytest.raises(RuntimeError, match="not ready"):
         await driver.load("main")
     assert not proc.running
+
+
+async def test_inherited_descriptors_are_not_passed_to_children(tmp_path):
+    """A router started while holding a lock fd must not hand it to its model children."""
+    out = tmp_path / "fd.txt"
+    read_fd, write_fd = os.pipe()
+    os.set_inheritable(write_fd, True)  # as if inherited from a `flock` wrapper
+    code = textwrap.dedent(
+        """
+        import os, sys, time
+        try:
+            os.fstat(int(sys.argv[2]))
+            open(sys.argv[1], "w").write("open")
+        except OSError:
+            open(sys.argv[1], "w").write("closed")
+        """
+    )
+    proc = ManagedProcess(
+        "fds", [PY, "-c", code, str(out), str(write_fd)], restart=RestartPolicy.NEVER
+    )
+    try:
+        await proc.start()
+        await wait_for(lambda: out.exists() and out.read_text())
+        assert out.read_text() == "closed"
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+        await proc.stop()
+
+
+async def test_restart_now_restarts_unless_policy_is_never(gpu_file):
+    proc = ManagedProcess("svc", [PY, BLACKBOX, gpu_file, "1"], kill_grace_s=1)
+    await proc.start()
+    first = proc.pid
+    await proc.restart_now()
+    assert proc.running and proc.pid != first
+    proc.restart = RestartPolicy.NEVER
+    await proc.restart_now()
+    assert not proc.running

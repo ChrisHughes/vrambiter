@@ -168,7 +168,7 @@ class Daemon:
             )
         else:
             assert process is not None
-            self.arbiter.add_cooperative_satellite(sat.name, force_stop=process.stop)
+            self.arbiter.add_cooperative_satellite(sat.name, force_stop=process.restart_now)
 
     async def start(self) -> None:
         await self.arbiter.start()

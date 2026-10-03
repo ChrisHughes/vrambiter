@@ -494,3 +494,18 @@ def test_queue_admitted_model_is_not_a_victim_later_in_the_pass():
     out = plan_queue([lease("a/res", need=2, seq=1), load("b/new", need=10, seq=2)], s)
     assert out[0][1] == Admit()
     assert not isinstance(out[1][1], Evict)
+
+
+def test_queue_never_leases_a_model_chosen_as_victim_in_the_same_pass():
+    # X's load evicts Y; a lease request for Y later in the pass must not be told "ready".
+    s = snap(idle("drv/Y", 10), free=0, total=10)
+    out = plan_queue([load("drv/X", need=10, seq=1), lease("drv/Y", need=0, seq=2)], s)
+    assert out[0][1] == Evict(("drv/Y",), G(10))
+    assert isinstance(out[1][1], Wait) and out[1][1].kind is WaitKind.QUEUED
+
+
+def test_queue_two_requests_for_one_unloaded_model_evict_once():
+    s = snap(idle("v/y", 10, last_used=1), idle("v/z", 10, last_used=2), free=4, total=24)
+    out = plan_queue([load("s/x", need=10, seq=1), load("s/x", need=10, seq=2)], s)
+    assert out[0][1] == Evict(("v/y",), G(10))
+    assert isinstance(out[1][1], Wait) and out[1][1].kind is WaitKind.QUEUED

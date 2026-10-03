@@ -129,8 +129,13 @@ all idle it attributes that usage to them:
   in its own PID namespace, typically): measurements are treated as unknown, declared sizes are
   used, and this is logged once.
 
-Measurements are not taken while a satellite has a model loading or leased, since the process total
-then includes transient working memory that is nobody's residency.
+Measurements are not taken while a satellite has a model loading, leased or being evicted, or
+while its freed memory is still settling, since the process total then includes memory that is
+nobody's residency.
+
+Free memory and per-process usage cannot be read atomically. Each snapshot reads per-process usage
+before and after the free reading and keeps the smaller figure per process, so an allocation (or a
+free) landing between the reads can never count as both free and already held.
 
 ## Reservations
 
@@ -138,11 +143,14 @@ Reserved memory is subtracted from free memory before any admission. It covers l
 the working headroom of busy models, and it is computed per satellite process as an **envelope**:
 
 ```
-envelope    = Σ peak of loading models + Σ max(peak, resident) of busy models
+envelope    = baseline + Σ peak of loading models + Σ max(peak, resident) of busy models
               + Σ resident of idle models
 outstanding = Σ peak of loading models + Σ (peak - resident) of busy models
 reserved    = clamp(envelope - usage_of_the_process, 0, outstanding)
 ```
+
+(`baseline` is the process's learned floor, the CUDA context and allocator pool: it is in the
+process's usage but in no model's estimate.)
 
 So a load reserves its full peak at first and less as it allocates (no double counting of what the
 driver already shows as used), and a leased model keeps the room it may still grow into while it
@@ -198,11 +206,13 @@ ever made on numbers older than the request.
 snapshot that each decision updates: an admission reserves its need and takes a load slot; an
 eviction marks its victims; a request left waiting on VRAM *earmarks* the room it is counting on,
 so later requests may **backfill** into what remains but never take an earlier request's room; a
-load left waiting at the host gate holds back later loads, so loads start in queue order; and a
+load left waiting at the host gate holds back later loads, so loads start in queue order; a
 request that would fail while requests ahead of it on the same device are still waiting waits
-instead, since their admission changes the picture. A request may carry a timeout; expiry fails it
+instead, since their admission changes the picture; one decision is made per model per pass (a
+second request for a model being loaded, evicted for or waited on just queues behind the first);
+and a model chosen as a victim earlier in the pass is not leased later in it. A request may carry a timeout; expiry fails it
 with `VramUnavailable` naming the holders. `wait=False` (or a zero timeout) fails instead of
-waiting, but still lets evictions run.
+waiting (including waiting behind other requests), but still lets its own evictions run.
 
 ## Eviction
 
@@ -214,7 +224,9 @@ waiting, but still lets evictions run.
    or if `unload` raised.
 3. If no reply arrives within `evict_timeout` (default 30 s):
    - managed process: SIGTERM to its process group, then SIGKILL after `kill_grace`, only when the
-     model is that process's only resident model or policy `kill_on_evict_timeout` is set.
+     model is that process's only resident model or policy `kill_on_evict_timeout` is set. A
+     cooperative satellite or a llama-server router is then started again (its restart policy
+     permitting); if the stop changed nothing, the model falls back to `unresponsive`.
    - otherwise: the model is marked `unresponsive` and excluded from victim selection, and the
      request re-plans.
 4. After `evicted`, the model is `UNLOADED` but its memory is counted as **settling** (see below)
@@ -269,6 +281,10 @@ status   {}                                    ->   status {arbiter, devices, ho
 - `register` with `state: "resident"`, `vram_bytes` and `leases: n` is how a satellite re-registers
   after a reconnect or an arbiter restart: the arbiter believes it, marks the model resident and
   busy, and returns `n` adopted lease ids in `ok.leases` so the satellite's later `release`s match.
+  `state: "loading"` does the same for a load granted on the previous connection and still
+  running: the model is `LOADING`, with its reservation and load slot, until `loaded` arrives.
+  (`loaded` and `load_failed` describe the model's state now and are sent on whichever connection
+  is live; lease ids only mean something on their own connection.)
 - A satellite addresses its own models by short name and any model by full id.
 - Error replies are `{type: "error", id, code, message, detail}`. Codes: `vram_unavailable`,
   `host_ram_unavailable` (both with `detail` = need, free, reason, holders), `unknown_model`,
@@ -324,8 +340,13 @@ with arb.lease("llama/gemma-4-26b"):   # consumer lease on an adapter-backed mod
 - Local lease counting: a lease is counted locally *before* its `acquire` is sent, and an `evict`
   that finds the count non-zero is answered `evict_refused` immediately. This holds even when the
   arbiter's view is stale.
+- A `ready` grant for a model that is not resident here (a voluntary unload or a late eviction
+  raced the lease) is never loaded behind the arbiter's back: the client reports `unloaded`,
+  releases the grant and asks again, which gets an admitted `load`.
 - Cancelling an async acquire (or interrupting a sync one) sends `cancel`; a grant already on its
-  way is released on arrival.
+  way, or already arrived, is released.
+- Requests are tracked per connection: when a connection drops, exactly its requests fail (the
+  callers carry on standalone) and a single reconnect loop runs.
 - **Standalone mode** (`NullArbiter`): `lease()` loads on first use and never unloads. Behaviour
   without an arbiter is exactly what a plain server would do.
 - If the arbiter goes away mid-run, the client falls back to standalone behaviour and reconnects in
@@ -412,11 +433,30 @@ exactly. When that is not possible (the arbiter does not run the router, so has 
 driver hides per-process numbers) it falls back to the drop in free memory across the load, which
 is right as long as nothing else moved meanwhile (loads are serialised, so usually nothing did).
 Every poll the adapter also lists `/models` and reports loads and unloads the router made on its
-own (autoload for a request, `--sleep-idle-seconds`), which the arbiter then tracks.
+own (autoload for a request, `--sleep-idle-seconds`), which the arbiter then tracks. Only declared
+models are considered (the router also lists cache entries and duplicates). A poll result computed
+before a transition the arbiter made meanwhile is dropped as stale (models carry a version that
+every phase change bumps).
+
+**Dead instances.** A child instance can die while the router still lists the model as `loaded`;
+every request to it then fails with HTTP 500 `proxy error: Could not establish connection` until
+the model is unloaded. So `/models` is never trusted alone: each poll checks that the child
+processes recorded at load time are alive and, for a model loaded behind the arbiter's back (no
+pids recorded), probes `GET /props?model=<id>&autoload=false` every few seconds (proxied to the
+child: 200 alive, 500 `proxy error` dead, 400 not loaded). A dead instance is reported as
+`"dead"`: the arbiter marks the model unloaded even if leased (consumers get a `lease_lost`
+notice), the adapter unloads the stale router entry, and the next lease loads a fresh instance.
+A load that finds the model "loaded" but dead does the same before loading.
 
 Recommended router flags: `--models-max 0` (no router-side LRU; vrambiter decides what to evict)
-and `--no-models-autoload` (a request for an unloaded model fails instead of loading it behind the
-arbiter's back; consumers take a lease, which loads it).
+and `--no-models-autoload` (a request for an unloaded model fails with HTTP 400 instead of loading
+it behind the arbiter's back; consumers take a lease, which loads it). Measured on llama-server
+b11379: loads of 30-40 GB Q8 models take 21-33 s and an unload returns the child's VRAM within
+1-2 s; the router process itself holds no VRAM.
+
+Managed processes are spawned with no inherited file descriptors (`close_fds`): a router started
+while holding, say, an inherited `flock` descriptor would pass it to every model child, which then
+keeps the lock open forever.
 
 ## Backends (seams for testing)
 
@@ -522,3 +562,13 @@ the standard library; `integrations/torch.py` never imports torch itself. The da
 - **Black boxes** are exactly one model, never auto-restarted; `autostart` loads them through
   admission. Signals always go to the process group.
 - **Consumer leases** work for managed (black-box) models as well as adapter-backed ones.
+- **Found in review and fixed** (each with a regression test): a grant arriving as its acquirer
+  gave up leaked its lease (and with it the load slot); a link drop mid-reconnect started a second
+  reconnect loop and could strand requests; a model registered during a reconnect was never
+  registered; a lease racing a voluntary unload reloaded without admission; snapshots could count
+  one allocation as both free and held; reservations ignored the learned baseline; one queue pass
+  could lease a model it had just chosen as a victim, or evict twice for two requests for the same
+  model; a driven model's `unresponsive` flag could stick; a driven load finishing after its process
+  died left the request unanswered; a stale adapter poll could undo a transition.
+- **llama-server dead instances** (from benchmarking b11379): a crashed child stays listed as
+  loaded, so the adapter checks child pids and probes `/props` rather than trusting `/models`.

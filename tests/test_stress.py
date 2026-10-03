@@ -63,6 +63,9 @@ class Weights:
 )
 async def test_random_leases_never_overcommit_the_card(sock_path, seed, vram, slots, priorities):
     rng = random.Random(seed)
+    # Mixed priorities can starve low-priority requests (by design: priority, then FIFO); keep
+    # their timeouts short so starvation shows up as a quick VramUnavailable, not a slow test.
+    lease_timeout = 30 if len(set(priorities)) == 1 else 2
     d = make_daemon(
         sock_path,
         vram=vram,
@@ -103,7 +106,7 @@ async def test_random_leases_never_overcommit_the_card(sock_path, seed, vram, sl
             for _ in range(ROUNDS):
                 model, w = r.choice(models)
                 try:
-                    with model.lease(timeout=30):
+                    with model.lease(timeout=lease_timeout):
                         w.work()
                 except BaseException as exc:  # an OOM here is an arbiter bug
                     errors.append(exc)

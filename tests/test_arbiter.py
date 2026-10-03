@@ -757,3 +757,190 @@ async def test_reconnect_to_same_arbiter_drops_stale_settles(arb, gpu):
     [ev] = again.evicts()  # evicts straight away instead of waiting on a phantom return
     again.evicted(ev, free=8)
     await granted(arb, b, rid)
+
+
+# --------------------------------------------------------------------------- driven models
+
+
+class FakeDriver:
+    """An adapter-like driver whose loads allocate on the fake GPU under one pid."""
+
+    from vrambiter.state import OwnerKind as _OK
+
+    kind = _OK.ADAPTER
+
+    def __init__(self, gpu, pid, sizes):
+        self.gpu, self.pid, self.sizes = gpu, pid, sizes
+        self.calls = []
+        self.fail_unload = False
+        self.gate = None
+        self.stops = 0
+
+    async def load(self, model):
+        from vrambiter.arbiter import LoadResult
+
+        self.calls.append(("load", model))
+        if self.gate is not None:
+            await self.gate.wait()
+        self.gpu.allocate(self.pid, self.sizes[model])
+        return LoadResult(vram_bytes=self.sizes[model])
+
+    async def unload(self, model):
+        self.calls.append(("unload", model))
+        if self.fail_unload:
+            raise RuntimeError("router not answering")
+        self.gpu.free(self.pid, self.sizes[model])
+
+    def root_pids(self):
+        return frozenset({self.pid})
+
+    async def force_stop(self):
+        self.stops += 1
+
+
+def drive(arb, gpu, sizes, name="llama", pid=300, managed=False):
+    from vrambiter.arbiter import ModelSpec
+
+    driver = FakeDriver(gpu, pid, {m: int(s * GiB) for m, s in sizes.items()})
+    arb.add_driven_satellite(
+        name,
+        driver,
+        [ModelSpec(m, vram_peak=int(s * GiB)) for m, s in sizes.items()],
+        managed=managed,
+    )
+    return driver
+
+
+async def test_consumer_lease_loads_through_the_driver(arb, gpu):
+    driver = drive(arb, gpu, {"gemma": 8})
+    app = Sat(arb, gpu, "app", 500)
+    g = await granted(arb, app, app.acquire("llama/gemma"))
+    assert g.action == "ready" and driver.calls == [("load", "gemma")]
+    assert arb.registry.models["llama/gemma"].state_label == "busy"
+
+
+async def test_driven_unresponsive_flag_does_not_stick(arb, gpu, clock):
+    driver = drive(arb, gpu, {"gemma": 8})
+    app = Sat(arb, gpu, "app", 500)
+    g = await granted(arb, app, app.acquire("llama/gemma"))
+    app.request(p.Release(lease=g.lease))
+    driver.fail_unload = True
+    ctl = Sat(arb, gpu, "cli", 1, role="control")
+    ctl.request(p.EvictModel(model="llama/gemma"))
+    await arb.quiesce()
+    clock.advance(arb.settings.evict_timeout_s)
+    gemma = arb.registry.models["llama/gemma"]
+    assert gemma.unresponsive
+    gpu.free(300)
+    arb.external_model_state("llama", "gemma", "unloaded")  # the router dropped it after all
+    assert gemma.phase.value == "unloaded" and not gemma.unresponsive
+    driver.fail_unload = False
+    g = await granted(arb, app, app.acquire("llama/gemma"))
+    assert not gemma.unresponsive
+
+
+async def test_driven_load_finishing_after_its_process_died_still_answers(arb, gpu):
+    import asyncio
+
+    driver = drive(arb, gpu, {"gemma": 8}, managed=True)
+    driver.gate = asyncio.Event()
+    app = Sat(arb, gpu, "app", 500)
+    rid = app.acquire("llama/gemma")
+    await arb.quiesce()
+    arb.satellite_process_exited("llama")  # dies just as the load completes
+    driver.gate.set()
+    for _ in range(100):
+        if app.reply(rid) is not None:
+            break
+        await asyncio.sleep(0.01)
+    reply = app.reply(rid)
+    assert isinstance(reply, p.Error) and "went away while loading" in reply.message
+
+
+async def test_dead_instance_ends_leases_with_a_notice(arb, gpu):
+    drive(arb, gpu, {"gemma": 8})
+    app = Sat(arb, gpu, "app", 500)
+    await granted(arb, app, app.acquire("llama/gemma"))
+    gpu.free(300)
+    arb.external_model_state("llama", "gemma", "dead")
+    gemma = arb.registry.models["llama/gemma"]
+    assert gemma.phase.value == "unloaded" and not gemma.leases
+    notices = [m for m in app.sent if isinstance(m, p.Notice)]
+    assert notices and notices[-1].kind == "lease_lost"
+
+
+async def test_poll_result_from_before_a_transition_is_dropped(arb, gpu):
+    import asyncio
+
+    drive(arb, gpu, {"gemma": 8})
+    gemma = arb.registry.models["llama/gemma"]
+
+    async def stale_poll():
+        # While the listing is in flight, the model is loaded and evicted again by the arbiter.
+        gemma.phase = gemma.phase.__class__.LOADING
+        gemma.phase = gemma.phase.__class__.UNLOADED
+        await asyncio.sleep(0)
+        return {"gemma": "loaded"}
+
+    await arb._run_driver_poll("llama", stale_poll)
+    assert gemma.phase.value == "unloaded"  # the stale "loaded" did not resurrect it
+
+
+async def test_wait_false_behind_a_load_fails_instead_of_waiting(arb, gpu):
+    a = Sat(arb, gpu, "a", 100)
+    a.register("x", 2)
+    a.register("y", 2)
+    await granted(arb, a, a.acquire("x"))  # holds the only load slot
+    a.acquire("y")  # waits for the slot
+    a.register("z", 2)
+    await errored(arb, a, a.acquire("z", wait=False), "vram_unavailable")
+
+
+async def test_reregistering_a_model_mid_load_keeps_its_reservation(arb, gpu):
+    a = Sat(arb, gpu, "a", 100)
+    reply = a.request(p.Register(model="m", vram_peak=10 * GiB, state="loading", leases=1))
+    assert isinstance(reply, p.Ok) and len(reply.leases) == 1
+    await arb.quiesce()
+    m = arb.registry.models["a/m"]
+    assert m.phase.value == "loading" and arb._last_snapshot.devices[0].reserved == 10 * GiB
+    assert arb._last_snapshot.loads_in_flight == 1
+    a.load("m", 8)
+    assert m.phase.value == "resident"
+
+
+async def test_late_evicted_ends_leases_granted_after_the_timeout(arb, gpu, clock):
+    a = Sat(arb, gpu, "a", 100)
+    await resident(arb, a, "m", 8)
+    ctl = Sat(arb, gpu, "cli", 1, role="control")
+    ctl.request(p.EvictModel(model="a/m"))
+    [ev] = a.evicts()
+    clock.advance(arb.settings.evict_timeout_s)
+    await arb.quiesce()
+    g = await granted(arb, a, a.acquire("m"))  # the owner leases it; it is still unloading
+    a.evicted(ev)  # ...and the late reply lands
+    m = arb.registry.models["a/m"]
+    assert m.phase.value == "unloaded" and not m.leases
+    assert isinstance(a.request(p.Release(lease=g.lease)), p.Ok)
+
+
+async def test_force_stop_that_changes_nothing_falls_back_to_unresponsive(arb, gpu, clock):
+    stops = []
+
+    async def noop_stop():
+        stops.append(1)  # e.g. a managed satellite we did not start ourselves
+
+    arb.add_cooperative_satellite("a", force_stop=noop_stop)
+    a = Sat(arb, gpu, "a", 100)
+    await resident(arb, a, "m", 8)
+    ctl = Sat(arb, gpu, "cli", 1, role="control")
+    ctl.request(p.EvictModel(model="a/m"))
+    clock.advance(arb.settings.evict_timeout_s)
+    await arb.quiesce()
+    import asyncio
+
+    for _ in range(100):
+        if arb.registry.models["a/m"].unresponsive:
+            break
+        await asyncio.sleep(0.01)
+    m = arb.registry.models["a/m"]
+    assert stops == [1] and m.phase.value == "resident" and m.unresponsive

@@ -270,3 +270,11 @@ def test_registry_resolve_and_leases():
     assert own.leases == set() and own.last_used == 9.0
     assert reg.end_lease(lease.id, now=10.0) is None
     assert reg.next_evict_id() != reg.next_evict_id()
+
+
+def test_reservation_includes_the_learned_baseline():
+    """The CUDA context is in the process's usage but in no model's estimate."""
+    loading = model("x", peak=10, phase=Phase.LOADING, leases=1)
+    # 1 GiB context + 3 GiB of x loaded so far: 7 GiB of x still to come.
+    assert satellite_reservation([loading], 4 * GiB, baseline=GiB) == 7 * GiB
+    assert satellite_reservation([loading], 4 * GiB) == 6 * GiB  # what it used to be: short

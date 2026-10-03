@@ -166,7 +166,18 @@ class Lease:
             if self.released:
                 return
             self.released = True
-        self._owner._lease_ended(self)
+            lease_id, epoch = self.arbiter_lease, self.epoch
+        self._owner._lease_ended(self, lease_id, epoch)
+
+    def _adopt(self, lease_id: str, epoch: int) -> bool:
+        """Take an id the arbiter assigned on a newer connection. False if already released
+        (the caller then releases ``lease_id`` itself)."""
+        with self._lock:
+            if self.released:
+                return False
+            if epoch >= self.epoch:
+                self.arbiter_lease, self.epoch = lease_id, epoch
+            return True
 
     def __enter__(self) -> Lease:
         return self
@@ -180,7 +191,9 @@ class Lease:
 
 
 class _LeaseOwner:
-    def _lease_ended(self, lease: Lease) -> None:  # pragma: no cover - interface
+    def _lease_ended(
+        self, lease: Lease, lease_id: str | None, epoch: int
+    ) -> None:  # pragma: no cover - interface
         raise NotImplementedError
 
 
@@ -242,6 +255,7 @@ class Model(_LeaseOwner):
         self._count_lock = threading.Lock()
         self._active: list[Lease] = []
         self._resident = False
+        self._loading = False
         self.vram_bytes: int | None = None
         self.last_used = 0.0
         #: The connection epoch on which the arbiter accepted this model's registration.
@@ -345,45 +359,60 @@ class Model(_LeaseOwner):
             # Counted before the acquire is sent: from here on an evict for this model is refused.
             self._active.append(placeholder)
         try:
-            grant = self._arbiter._acquire(
-                self.name, wait=wait, timeout=timeout, token=token, on_wait=on_wait
-            )
-            self._ensure_resident(grant)
+            for attempt in range(3):
+                grant = self._arbiter._acquire(
+                    self.name, wait=wait, timeout=timeout, token=token, on_wait=on_wait
+                )
+                if self._ensure_resident(grant, last_try=attempt == 2):
+                    break
         except BaseException:
             with self._count_lock:
                 self._active.remove(placeholder)
             raise
         placeholder._grant = grant
         if grant.lease_id is not None:
-            placeholder.arbiter_lease = grant.lease_id
-            placeholder.epoch = grant.epoch
-        # else: standalone, unless a reconnect adopted this lease meanwhile (then keep that id).
+            # Unless a reconnect already adopted this lease under a newer connection's id.
+            placeholder._adopt(grant.lease_id, grant.epoch)
         self.last_used = time.monotonic()
         return placeholder
 
-    def _ensure_resident(self, grant: _Grant) -> None:
+    def _ensure_resident(self, grant: _Grant, *, last_try: bool = True) -> bool:
+        """Make the model resident for ``grant``. False: the grant was stale, ask again.
+
+        ``loaded``/``load_failed`` describe the model's state now, so they go to whichever
+        arbiter is connected (a load can outlive the connection it was granted on); a lease id
+        only means something on its own connection.
+        """
         with self._lock:
             if self._resident:
                 if grant.action == "load":
                     # The arbiter thought it unloaded (a reconnect); it is here, say so.
                     self._arbiter._notify(p.Loaded(model=self.name, vram_bytes=self.vram_bytes))
-                return
+                return True
+            if grant.lease_id is not None and grant.action == "ready" and not last_try:
+                # The arbiter believes it resident, but it was unloaded meanwhile (a voluntary
+                # unload or a late eviction raced this lease). Loading now would bypass
+                # admission: correct the arbiter and ask again, which gets an admitted "load".
+                self._arbiter._notify(p.Unloaded(model=self.name))
+                self._arbiter._notify(p.Release(lease=grant.lease_id), epoch=grant.epoch)
+                return False
+            self._loading = True
             try:
                 self.vram_bytes = self._do_load()
             except BaseException as exc:
                 if grant.lease_id is not None:
                     self._arbiter._notify(
-                        p.LoadFailed(model=self.name, error=f"{type(exc).__name__}: {exc}"),
-                        epoch=grant.epoch,
+                        p.LoadFailed(model=self.name, error=f"{type(exc).__name__}: {exc}")
                     )
                     self._arbiter._notify(p.Release(lease=grant.lease_id), epoch=grant.epoch)
                 raise
+            finally:
+                self._loading = False
             if grant.lease_id is not None:
                 if grant.action != "load":
                     log.warning("%s: granted 'ready' but not resident here; loaded it", self.name)
-                self._arbiter._notify(
-                    p.Loaded(model=self.name, vram_bytes=self.vram_bytes), epoch=grant.epoch
-                )
+                self._arbiter._notify(p.Loaded(model=self.name, vram_bytes=self.vram_bytes))
+            return True
 
     def _do_load(self) -> int | None:
         before = None if self._measure_fn else _torch_reserved(self.device)
@@ -408,12 +437,12 @@ class Model(_LeaseOwner):
         if self._cleanup:
             _release_cached_memory()
 
-    def _lease_ended(self, lease: Lease) -> None:
+    def _lease_ended(self, lease: Lease, lease_id: str | None, epoch: int) -> None:
         with self._count_lock, contextlib.suppress(ValueError):
             self._active.remove(lease)
         self.last_used = time.monotonic()
-        if lease.arbiter_lease is not None:
-            self._arbiter._notify(p.Release(lease=lease.arbiter_lease), epoch=lease.epoch)
+        if lease_id is not None:
+            self._arbiter._notify(p.Release(lease=lease_id), epoch=epoch)
 
     def _handle_evict(self, evict: p.Evict, epoch: int) -> None:
         """Called on a worker thread for an ``evict`` from the arbiter (on connection ``epoch``)."""
@@ -448,6 +477,9 @@ class Model(_LeaseOwner):
         """The ``register`` describing this model as it is now, plus the leases to adopt."""
         with self._count_lock:
             held = [lease for lease in self._active if not lease.released]
+        state = "loading" if self._loading else ("resident" if self._resident else "unloaded")
+        if state == "unloaded":
+            held = []
         return (
             p.Register(
                 model=self.name,
@@ -457,11 +489,11 @@ class Model(_LeaseOwner):
                 priority=self.priority,
                 pinned=self.pinned,
                 device=self.device,
-                state="resident" if self._resident else "unloaded",
+                state=state,
                 vram_bytes=self.vram_bytes,
-                leases=len(held) if self._resident else 0,
+                leases=len(held),
             ),
-            held if self._resident else [],
+            held,
         )
 
     def __repr__(self) -> str:
@@ -489,9 +521,9 @@ class _ConsumerLeases(_LeaseOwner):
         )
         return Lease(self, model_id, grant)
 
-    def _lease_ended(self, lease: Lease) -> None:
-        if lease.arbiter_lease is not None:
-            self._arbiter._notify(p.Release(lease=lease.arbiter_lease), epoch=lease.epoch)
+    def _lease_ended(self, lease: Lease, lease_id: str | None, epoch: int) -> None:
+        if lease_id is not None:
+            self._arbiter._notify(p.Release(lease=lease_id), epoch=epoch)
 
 
 # --------------------------------------------------------------------------- the arbiters
@@ -700,12 +732,13 @@ class ArbiterClient(_Base):
         self._reconnect_enabled = reconnect and role == "satellite"
         self._ids = itertools.count(1)
         self._state_lock = threading.Lock()
-        self._pending: dict[int, cf.Future[p.Message]] = {}
+        self._pending: dict[int, tuple[cf.Future[p.Message], int]] = {}  # id -> (future, epoch)
         self._waiters: dict[int, WaitFn] = {}
         self._abandoned: set[int] = set()
         self._link_up = False  # the socket is usable
         self._ready = False  # ...and models are registered: user requests may use it
         self._epoch = 0
+        self._established = False
         self._closed = False
         self._writer: asyncio.StreamWriter | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
@@ -756,44 +789,56 @@ class ArbiterClient(_Base):
             self._writer = writer
             self._link_up = True
             self._epoch += 1
-        self._reader_task = asyncio.create_task(self._read_loop(reader, self._epoch))
+            epoch = self._epoch
+        self._reader_task = asyncio.create_task(self._read_loop(reader, epoch))
         try:
             welcome = await self._request_async(
                 p.Hello(name=self.name, pid=self.pid, version=_version(), role=self.role)
             )
             self.arbiter_version = getattr(welcome, "arbiter_version", "")
-            for model in self.models.values():
-                try:
-                    await self._register_async(model)
-                except ArbiterUnavailable:
-                    raise
-                except VrambiterError as exc:
-                    # One model the new arbiter rejects (a device it does not have, say) must
-                    # not keep the others from coordinating. It stays usable standalone.
-                    log.error("re-registering %s failed: %s", model.name, exc)
+            await self._register_all(epoch)
         except BaseException:
             writer.close()
             with self._state_lock:
-                self._link_up = False
+                if self._epoch == epoch:
+                    self._link_up = self._ready = False
+                    self._writer = None
+            self._fail_pending(up_to=epoch)
             raise
         with self._state_lock:
             self._ready = True
+            self._established = True
+        # A model registered while the handshake was in flight saw the link not ready and left
+        # its registration to us; the loop above had already taken its copy of the models.
+        await self._register_all(epoch)
         log.info(
             "connected to arbiter %s at %s as %s", self.arbiter_version, self.socket_path, self.name
         )
 
+    async def _register_all(self, epoch: int) -> None:
+        for model in self.models.values():
+            if model._registered_epoch == epoch:
+                continue
+            try:
+                await self._register_async(model)
+            except ArbiterUnavailable:
+                raise
+            except VrambiterError as exc:
+                # One model the new arbiter rejects (a device it does not have, say) must not
+                # keep the others from coordinating. It stays usable standalone.
+                log.error("re-registering %s failed: %s", model.name, exc)
+
     async def _register_async(self, model: Model) -> None:
         message, held = model._register_message()
+        epoch = self._epoch
         reply = await self._request_async(message)
-        model._registered_epoch = self._epoch
+        model._registered_epoch = epoch
         adopted = list(getattr(reply, "leases", None) or [])
-        with model._count_lock:
-            still_held = [lease for lease in held if not lease.released]
-        for lease, lease_id in zip(still_held, adopted, strict=False):
-            lease.arbiter_lease = lease_id
-            lease.epoch = self._epoch
-        for lease_id in adopted[len(still_held) :]:
-            self._notify(p.Release(lease=lease_id))  # released while we were re-registering
+        for lease, lease_id in zip(held, adopted, strict=False):
+            if not lease._adopt(lease_id, epoch):
+                self._notify(p.Release(lease=lease_id))  # released while we re-registered
+        for lease_id in adopted[len(held) :]:
+            self._notify(p.Release(lease=lease_id))
 
     async def _read_loop(self, reader: asyncio.StreamReader, epoch: int) -> None:
         try:
@@ -809,21 +854,21 @@ class ArbiterClient(_Base):
                 except VrambiterError as exc:
                     log.warning("bad message from arbiter: %s", exc)
                     continue
-                self._dispatch(message)
+                self._dispatch(message, epoch)
         except (OSError, ValueError, asyncio.IncompleteReadError):
             pass
         finally:
             self._link_lost(epoch)
 
-    def _dispatch(self, message: p.Message) -> None:
+    def _dispatch(self, message: p.Message, epoch: int) -> None:
         if isinstance(message, p.Evict):
             model = self.models.get(message.model)
             if model is None:
-                self._notify(p.Evicted(model=message.model, evict_id=message.evict_id))
+                self._notify(p.Evicted(model=message.model, evict_id=message.evict_id), epoch)
                 return
             threading.Thread(
                 target=model._handle_evict,
-                args=(message, self._epoch),
+                args=(message, epoch),
                 name=f"vrambiter-evict-{model.name}",
                 daemon=True,
             ).start()
@@ -843,37 +888,54 @@ class ArbiterClient(_Base):
         if message.id is None:
             return
         with self._state_lock:
-            future = self._pending.pop(message.id, None)
+            entry = self._pending.pop(message.id, None)
             abandoned = message.id in self._abandoned
             self._abandoned.discard(message.id)
-        if abandoned and isinstance(message, p.Granted):
-            self._notify(p.Release(lease=message.lease))  # its acquirer gave up
+        future = entry[0] if entry is not None else None
+        if isinstance(message, p.Granted) and (abandoned or future is None or future.cancelled()):
+            # Its acquirer gave up (cancelled, timed out) before or while the grant travelled:
+            # a lease nobody holds must not stay busy on the arbiter.
+            self._notify(p.Release(lease=message.lease), epoch)
             return
         if future is not None and not future.done():
             future.set_result(message)
 
-    def _link_lost(self, epoch: int) -> None:
+    def _fail_pending(self, up_to: int | None = None) -> None:
+        """Fail requests sent on connection ``up_to`` or earlier (all of them if ``None``)."""
         with self._state_lock:
-            if epoch != self._epoch or not self._link_up:
-                return
-            self._link_up = False
-            self._ready = False
-            self._writer = None
-            pending, self._pending = self._pending, {}
-            self._abandoned.clear()
-        for future in pending.values():
+            doomed = [rid for rid, (_, ep) in self._pending.items() if up_to is None or ep <= up_to]
+            futures = [self._pending.pop(rid)[0] for rid in doomed]
+        for future in futures:
             if not future.done():
                 future.set_exception(_ConnectionLost())
-        if self._closed:
+
+    def _link_lost(self, epoch: int) -> None:
+        self._fail_pending(up_to=epoch)
+        with self._state_lock:
+            current = epoch == self._epoch and self._link_up
+            if current:
+                self._link_up = self._ready = False
+                self._writer = None
+                self._abandoned.clear()
+        if not current or self._closed:
             return
         log.warning("lost the arbiter; running standalone until it is back")
-        if self._reconnect_enabled:
+        self._start_reconnect()
+
+    def _start_reconnect(self) -> None:
+        """At most one reconnect loop, and only after a connection was once established."""
+        if not self._reconnect_enabled or not self._established or self._closed:
+            return
+        if self._reconnect_task is None or self._reconnect_task.done():
             self._reconnect_task = asyncio.ensure_future(self._reconnect())
 
     async def _reconnect(self) -> None:
         delay = 0.2
         while not self._closed:
             await asyncio.sleep(delay)
+            with self._state_lock:
+                if self._link_up:
+                    return
             try:
                 await self._open()
                 log.info("reconnected to the arbiter; models re-registered")
@@ -897,7 +959,7 @@ class ArbiterClient(_Base):
                 future.set_exception(_ConnectionLost())
                 return future
             message.id = next(self._ids)
-            self._pending[message.id] = future
+            self._pending[message.id] = (future, self._epoch)
             if on_wait is not None:
                 self._waiters[message.id] = on_wait  # before the write: no notice can be missed
             writer, epoch = self._writer, self._epoch
@@ -982,8 +1044,12 @@ class ArbiterClient(_Base):
             return _STANDALONE  # the arbiter went away: proceed as a plain server would
         except BaseException:
             # Interrupted (Ctrl-C, task cancelled, local timeout): withdraw the request, and make
-            # sure a grant that is already on its way gets released.
-            future.cancel()
+            # sure a grant that is already here, or on its way, gets released.
+            if not future.cancel() and not future.cancelled():
+                with contextlib.suppress(BaseException):
+                    reply = future.result(0)
+                    if isinstance(reply, p.Granted):
+                        self._notify(p.Release(lease=reply.lease), epoch=epoch)
             self._abandon(request_id)
             raise
         finally:
@@ -1039,11 +1105,8 @@ class ArbiterClient(_Base):
             with self._state_lock:
                 writer = self._writer
                 self._ready = self._link_up = False
-                pending, self._pending = self._pending, {}
             # Callers blocked on a reply carry on standalone rather than hang forever.
-            for future in pending.values():
-                if not future.done():
-                    future.set_exception(_ConnectionLost())
+            self._fail_pending()
             if writer is not None:
                 writer.close()
                 with contextlib.suppress(Exception):

@@ -97,6 +97,10 @@ class ManagedProcess:
                 env=env,
                 stdin=asyncio.subprocess.DEVNULL,
                 start_new_session=True,  # own process group: signals reach its children too
+                # Pass no inherited descriptors (the default, kept explicit on purpose): a router
+                # launched holding, say, a flock fd hands it to every model child, which then
+                # keeps the lock open forever.
+                close_fds=True,
             )
             self._proc = proc
             self._started_at = asyncio.get_running_loop().time()
@@ -167,6 +171,18 @@ class ManagedProcess:
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.shield(self._watch_task)
         return proc.returncode if proc is not None else None
+
+    async def restart_now(self) -> None:
+        """Stop the process group, then start it again unless the restart policy is ``never``.
+
+        The last resort after an eviction timed out: the models in it are gone either way, but a
+        service (a cooperative satellite, a llama-server router) should come back.
+        """
+        policy = self.restart
+        await self.stop()
+        if policy is not RestartPolicy.NEVER:
+            self.restarts += 1
+            await self.start()
 
     async def _reap_group(self, pgid: int) -> None:
         if not _group_alive(pgid):
