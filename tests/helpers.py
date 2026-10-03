@@ -200,3 +200,40 @@ def pid_alive(pid: int) -> bool:
 
 
 FAKES = os.path.join(os.path.dirname(__file__), "fakes")
+
+
+class ThreadedDaemon:
+    """A :class:`Daemon` on its own event loop thread, for testing synchronous callers (the CLI).
+
+    Uses the real clock: there is no test coroutine to advance a fake one.
+    """
+
+    def __init__(self, path: str, **kwargs: Any) -> None:
+        import threading
+
+        from vrambiter.clock import LoopClock
+
+        kwargs.setdefault("clock", LoopClock())
+        self.daemon = make_daemon(path, **kwargs)
+        self.loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+
+    def __enter__(self) -> Daemon:
+        self._thread.start()
+        asyncio.run_coroutine_threadsafe(self.daemon.start(), self.loop).result(10)
+        return self.daemon
+
+    def call(self, fn: Callable[[], Any]) -> Any:
+        """Run ``fn`` on the daemon's loop (state is only safe to touch there)."""
+
+        async def run() -> Any:
+            return fn()
+
+        return asyncio.run_coroutine_threadsafe(run(), self.loop).result(10)
+
+    def __exit__(self, *exc: object) -> None:
+        for client in self.daemon.clients:
+            client.close()
+        asyncio.run_coroutine_threadsafe(self.daemon.stop(), self.loop).result(10)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._thread.join(5)

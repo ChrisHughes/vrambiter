@@ -657,6 +657,10 @@ class Arbiter:
         self.active_profile = msg.name
         for model in self.registry.models.values():
             model.profile_pin = self._profile_matches(model.id)
+            if model.profile_pin:
+                # The most recent operator action wins: activating a profile that names this
+                # model overrides an earlier manual unpin (and makes a manual pin redundant).
+                model.manual_pin = None
         log.info("profile %s", f"{msg.name!r} active" if msg.name else "cleared")
         state.conn.send(p.Ok(id=msg.id))
         self.kick()
