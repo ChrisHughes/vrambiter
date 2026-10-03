@@ -169,7 +169,7 @@ arb = vrambiter.connect(name, socket=None, required=False, wait_s=0.0)
 model = arb.register(name, vram_peak=..., load=..., unload=None, vram_resident=None,
                      host_peak=0, priority=0, pinned=False, device=0, measure=None, cleanup=True)
 
-with model.lease(timeout=None, wait=True) as lease: ...     # sync
+with model.lease(timeout=None, wait=True, on_wait=None) as lease: ...   # sync
 async with model.alease(timeout=None, wait=True): ...       # asyncio
 lease = model.acquire(); ...; lease.release()                # manual
 model.unload()                                               # give it back now, if idle
@@ -177,6 +177,10 @@ model.unload()                                               # give it back now,
 with arb.lease("llama/gemma-4-26b"): ...                     # consumer lease by full id
 arb.status(); arb.pin(id); arb.unpin(id); arb.evict(id); arb.profile(name)
 ```
+
+`on_wait(reason)` is called (on the client's thread, so keep it quick) whenever the arbiter's reason
+for making the request wait changes, e.g. `"evicting tts/voxcpm2"` or `"waiting for
+sdxl-server/sdxl"`: enough for a job to report "waiting for the GPU" instead of looking hung.
 
 Errors derive from `vrambiter.VrambiterError`. `VramUnavailable` (and its subclass
 `HostRamUnavailable`) carries `need`, `free`, `reason` and `holders`, a list of `Holder(kind, name,

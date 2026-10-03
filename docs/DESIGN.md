@@ -269,7 +269,9 @@ status   {}                                    ->   status {arbiter, devices, ho
   `host_ram_unavailable` (both with `detail` = need, free, reason, holders), `unknown_model`,
   `registration_error`, `name_in_use`, `protocol_error`, `unknown_type`, `arbiter_error`,
   `internal_error`. The client maps them back to exception classes.
-- `notice` kinds: `lease_lost` (a consumer's lease ended because the model's process went away).
+- `notice` kinds: `waiting` (`data: {request, model, blockers}`, sent whenever the reason a queued
+  request waits changes; the client hands it to the caller's `on_wait`), and `lease_lost` (a
+  consumer's lease ended because the model's process went away).
 
 `acquire` on a model the caller does not own (a consumer lease) is allowed for adapter-backed and
 managed models: the arbiter loads it through the adapter or by starting the process if needed and
@@ -501,8 +503,8 @@ the standard library; `integrations/torch.py` never imports torch itself. The da
   size, and a satellite in another PID namespace measured 0 B and so was never evicted.
 - **Protocol additions**: `cancel` (withdraw a queued acquire), `evict_model` and `profile`
   (operator commands), `hello.role` (`control` connections for the CLI), re-registration fields on
-  `register` with adopted lease ids in `ok.leases`, `notice` kind `lease_lost`, and a list of error
-  codes. All additive; the protocol is still version 1.
+  `register` with adopted lease ids in `ok.leases`, `notice` kinds `waiting` (for `on_wait`) and
+  `lease_lost`, and a list of error codes. All additive; the protocol is still version 1.
 - **Names**: the client classes are `ArbiterClient` and `NullArbiter` (the daemon core is
   `arbiter.Arbiter`); `clock.py`, `daemon.py` and `_http.py` were added to the layout.
 - **Pins** have explicit precedence (operator override, then declaration or profile; activating a

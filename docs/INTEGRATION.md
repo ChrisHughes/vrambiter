@@ -96,6 +96,8 @@ async def generate(req):
   A's room waits until its timeout, because A is busy, by its own hand.
 - Pass a `timeout` and handle `vrambiter.VramUnavailable`: its message and `holders` say who has
   the memory, which is what a user needs to see instead of a hung job.
+- Pass `on_wait=` to surface waits as they happen (`lease(on_wait=lambda r: job.status(f"waiting
+  for the GPU: {r}"))`). It runs on vrambiter's thread: set a field or log, do not block.
 
 ### From an in-process arbiter
 

@@ -1269,6 +1269,22 @@ class Arbiter:
         if self.registry.settling:
             self._schedule_settle_check()
 
+    def _set_reason(self, q: _Queued, reason: str, blockers: tuple[str, ...] = ()) -> None:
+        """Record why a request waits; tell its requester when that changes (``notice`` kind
+        ``waiting``), so a job can say "waiting for the GPU: ..." instead of looking hung."""
+        if q.reason == reason:
+            return
+        q.reason = reason
+        log.info("%s waits: %s", q.model_id, reason)
+        if q.conn is not None and q.wait and q.conn.id in self._conns:
+            q.conn.send(
+                p.Notice(
+                    kind="waiting",
+                    message=reason,
+                    data={"request": q.request_id, "model": q.model_id, "blockers": list(blockers)},
+                )
+            )
+
     def _learn_baseline(self, settle: Settle, gpu: GpuSnapshot) -> None:
         """After an unload settles with nothing left resident, what the satellite still holds
         is its floor (CUDA context, allocator pool): not any model's residency."""
@@ -1299,7 +1315,7 @@ class Arbiter:
                 continue
             req = request_for(model, seq=q.seq)
             if req is None:
-                q.reason = f"{model.id} is {model.phase.value}"
+                self._set_reason(q, f"{model.id} is {model.phase.value}")
                 continue
             entries[q.seq] = q
             requests.append(req)
@@ -1310,15 +1326,13 @@ class Arbiter:
             if isinstance(decision, Admit):
                 self._grant(q, model, "load" if req.is_load else "ready")
             elif isinstance(decision, Evict):
-                q.reason = f"evicting {', '.join(decision.victims)}"
+                self._set_reason(q, f"evicting {', '.join(decision.victims)}", decision.victims)
                 for victim_id in decision.victims:
                     victim = self.registry.models[victim_id]
                     if victim.phase is Phase.RESIDENT and not victim.leases:
                         self._start_evict(victim, reason=f"making room for {model.id}")
             elif isinstance(decision, Wait):
-                if q.reason != decision.reason:
-                    log.info("%s waits: %s", model.id, decision.reason)
-                q.reason = decision.reason
+                self._set_reason(q, decision.reason, decision.blockers)
                 if not q.wait and decision.kind not in (WaitKind.EVICTING, WaitKind.QUEUED):
                     self._dequeue(q)
                     self._reply_error(q, self._unavailable(model, f"would wait: {decision.reason}"))

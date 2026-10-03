@@ -63,6 +63,9 @@ log = logging.getLogger("vrambiter.client")
 
 LoadFn = Callable[[], Any]
 MeasureFn = Callable[[], "int | None"]
+#: Called with the arbiter's reason whenever a queued request's wait reason changes. Runs on the
+#: client's background thread: keep it quick (log it, set a job status), never block in it.
+WaitFn = Callable[[str], None]
 
 
 def default_socket_path() -> str:
@@ -259,30 +262,38 @@ class Model(_LeaseOwner):
     def id(self) -> str:
         return f"{self._arbiter.name}/{self.name}"
 
-    def acquire(self, *, timeout: float | None = None, wait: bool = True) -> Lease:
+    def acquire(
+        self, *, timeout: float | None = None, wait: bool = True, on_wait: WaitFn | None = None
+    ) -> Lease:
         """Block until admitted, load if needed, and return a held :class:`Lease`."""
-        return self._begin(timeout=timeout, wait=wait, token=None)
+        return self._begin(timeout=timeout, wait=wait, token=None, on_wait=on_wait)
 
     @contextlib.contextmanager
-    def lease(self, *, timeout: float | None = None, wait: bool = True) -> Iterator[Lease]:
+    def lease(
+        self, *, timeout: float | None = None, wait: bool = True, on_wait: WaitFn | None = None
+    ) -> Iterator[Lease]:
         """``with model.lease():`` - the model is resident and busy inside the block.
 
         ``timeout`` bounds the wait for admission (the arbiter fails it with
-        :class:`~vrambiter.errors.VramUnavailable`); ``wait=False`` fails instead of queueing.
+        :class:`~vrambiter.errors.VramUnavailable`); ``wait=False`` fails instead of queueing;
+        ``on_wait(reason)`` hears why the request is waiting, each time that changes.
         """
-        lease = self.acquire(timeout=timeout, wait=wait)
+        lease = self.acquire(timeout=timeout, wait=wait, on_wait=on_wait)
         try:
             yield lease
         finally:
             lease.release()
 
-    async def aacquire(self, *, timeout: float | None = None, wait: bool = True) -> Lease:
+    async def aacquire(
+        self, *, timeout: float | None = None, wait: bool = True, on_wait: WaitFn | None = None
+    ) -> Lease:
         """Async :meth:`acquire`. The wait never blocks the caller's loop; ``load`` runs in a
         worker thread. Cancelling the awaiting task withdraws the request."""
         token = _CancelToken()
         loop = asyncio.get_running_loop()
         job = loop.run_in_executor(
-            None, lambda: self._begin(timeout=timeout, wait=wait, token=token)
+            None,
+            lambda: self._begin(timeout=timeout, wait=wait, token=token, on_wait=on_wait),
         )
         try:
             return await asyncio.shield(job)
@@ -298,10 +309,10 @@ class Model(_LeaseOwner):
 
     @contextlib.asynccontextmanager
     async def alease(
-        self, *, timeout: float | None = None, wait: bool = True
+        self, *, timeout: float | None = None, wait: bool = True, on_wait: WaitFn | None = None
     ) -> AsyncIterator[Lease]:
         """``async with model.alease():`` - asyncio variant of :meth:`lease`."""
-        lease = await self.aacquire(timeout=timeout, wait=wait)
+        lease = await self.aacquire(timeout=timeout, wait=wait, on_wait=on_wait)
         try:
             yield lease
         finally:
@@ -321,13 +332,22 @@ class Model(_LeaseOwner):
 
     # -- lease machinery ---------------------------------------------------------------------------
 
-    def _begin(self, *, timeout: float | None, wait: bool, token: _CancelToken | None) -> Lease:
+    def _begin(
+        self,
+        *,
+        timeout: float | None,
+        wait: bool,
+        token: _CancelToken | None,
+        on_wait: WaitFn | None = None,
+    ) -> Lease:
         placeholder = Lease(self, self.name, _STANDALONE)
         with self._count_lock:
             # Counted before the acquire is sent: from here on an evict for this model is refused.
             self._active.append(placeholder)
         try:
-            grant = self._arbiter._acquire(self.name, wait=wait, timeout=timeout, token=token)
+            grant = self._arbiter._acquire(
+                self.name, wait=wait, timeout=timeout, token=token, on_wait=on_wait
+            )
             self._ensure_resident(grant)
         except BaseException:
             with self._count_lock:
@@ -457,9 +477,16 @@ class _ConsumerLeases(_LeaseOwner):
         self._arbiter = arbiter
 
     def begin(
-        self, model_id: str, timeout: float | None, wait: bool, token: _CancelToken | None
+        self,
+        model_id: str,
+        timeout: float | None,
+        wait: bool,
+        token: _CancelToken | None,
+        on_wait: WaitFn | None = None,
     ) -> Lease:
-        grant = self._arbiter._acquire(model_id, wait=wait, timeout=timeout, token=token)
+        grant = self._arbiter._acquire(
+            model_id, wait=wait, timeout=timeout, token=token, on_wait=on_wait
+        )
         return Lease(self, model_id, grant)
 
     def _lease_ended(self, lease: Lease) -> None:
@@ -545,28 +572,45 @@ class _Base:
     def _announce(self, model: Model) -> None:
         pass
 
-    def acquire(self, model_id: str, *, timeout: float | None = None, wait: bool = True) -> Lease:
+    def acquire(
+        self,
+        model_id: str,
+        *,
+        timeout: float | None = None,
+        wait: bool = True,
+        on_wait: WaitFn | None = None,
+    ) -> Lease:
         """A consumer lease on another satellite's model, by full id (``"llama/gemma-4-26b"``)."""
-        return self._consumer.begin(model_id, timeout, wait, None)
+        return self._consumer.begin(model_id, timeout, wait, None, on_wait)
 
     @contextlib.contextmanager
     def lease(
-        self, model_id: str, *, timeout: float | None = None, wait: bool = True
+        self,
+        model_id: str,
+        *,
+        timeout: float | None = None,
+        wait: bool = True,
+        on_wait: WaitFn | None = None,
     ) -> Iterator[Lease]:
         """``with arb.lease("llama/gemma-4-26b"):`` - the model is resident and busy inside."""
-        lease = self.acquire(model_id, timeout=timeout, wait=wait)
+        lease = self.acquire(model_id, timeout=timeout, wait=wait, on_wait=on_wait)
         try:
             yield lease
         finally:
             lease.release()
 
     async def aacquire(
-        self, model_id: str, *, timeout: float | None = None, wait: bool = True
+        self,
+        model_id: str,
+        *,
+        timeout: float | None = None,
+        wait: bool = True,
+        on_wait: WaitFn | None = None,
     ) -> Lease:
         token = _CancelToken()
         loop = asyncio.get_running_loop()
         job = loop.run_in_executor(
-            None, lambda: self._consumer.begin(model_id, timeout, wait, token)
+            None, lambda: self._consumer.begin(model_id, timeout, wait, token, on_wait)
         )
         try:
             return await asyncio.shield(job)
@@ -581,9 +625,14 @@ class _Base:
 
     @contextlib.asynccontextmanager
     async def alease(
-        self, model_id: str, *, timeout: float | None = None, wait: bool = True
+        self,
+        model_id: str,
+        *,
+        timeout: float | None = None,
+        wait: bool = True,
+        on_wait: WaitFn | None = None,
     ) -> AsyncIterator[Lease]:
-        lease = await self.aacquire(model_id, timeout=timeout, wait=wait)
+        lease = await self.aacquire(model_id, timeout=timeout, wait=wait, on_wait=on_wait)
         try:
             yield lease
         finally:
@@ -591,7 +640,13 @@ class _Base:
 
     # Hooks the models call.
     def _acquire(
-        self, model: str, *, wait: bool, timeout: float | None, token: _CancelToken | None
+        self,
+        model: str,
+        *,
+        wait: bool,
+        timeout: float | None,
+        token: _CancelToken | None,
+        on_wait: WaitFn | None = None,
     ) -> _Grant:
         return _STANDALONE
 
@@ -646,6 +701,7 @@ class ArbiterClient(_Base):
         self._ids = itertools.count(1)
         self._state_lock = threading.Lock()
         self._pending: dict[int, cf.Future[p.Message]] = {}
+        self._waiters: dict[int, WaitFn] = {}
         self._abandoned: set[int] = set()
         self._link_up = False  # the socket is usable
         self._ready = False  # ...and models are registered: user requests may use it
@@ -773,6 +829,15 @@ class ArbiterClient(_Base):
             ).start()
             return
         if isinstance(message, p.Notice):
+            if message.kind == "waiting":
+                with self._state_lock:
+                    callback = self._waiters.get(message.data.get("request", -1))
+                if callback is not None:
+                    try:
+                        callback(message.message)
+                    except Exception:
+                        log.exception("on_wait callback failed")
+                return
             log.info("arbiter notice %s: %s", message.kind, message.message)
             return
         if message.id is None:
@@ -821,7 +886,9 @@ class ArbiterClient(_Base):
 
     # -- sending ----------------------------------------------------------------------------------
 
-    def _submit(self, message: p.Message, *, internal: bool = False) -> cf.Future[p.Message]:
+    def _submit(
+        self, message: p.Message, *, internal: bool = False, on_wait: WaitFn | None = None
+    ) -> cf.Future[p.Message]:
         """Assign an id, register for the reply, and queue the write - all in submission order."""
         future: cf.Future[p.Message] = cf.Future()
         with self._state_lock:
@@ -831,6 +898,8 @@ class ArbiterClient(_Base):
                 return future
             message.id = next(self._ids)
             self._pending[message.id] = future
+            if on_wait is not None:
+                self._waiters[message.id] = on_wait  # before the write: no notice can be missed
             writer, epoch = self._writer, self._epoch
         self._loop.call_soon_threadsafe(self._write, writer, epoch, message)
         return future
@@ -888,13 +957,19 @@ class ArbiterClient(_Base):
             pass  # lost the link meanwhile; the reconnect re-registers it
 
     def _acquire(
-        self, model: str, *, wait: bool, timeout: float | None, token: _CancelToken | None
+        self,
+        model: str,
+        *,
+        wait: bool,
+        timeout: float | None,
+        token: _CancelToken | None,
+        on_wait: WaitFn | None = None,
     ) -> _Grant:
         own = self.models.get(model)
         if own is not None and own._registered_epoch != self._epoch:
             return _STANDALONE  # this arbiter does not know the model (rejected or not yet sent)
         message = p.Acquire(model=model, wait=wait, timeout_s=timeout)
-        future = self._submit(message)
+        future = self._submit(message, on_wait=on_wait)
         if future.done() and isinstance(future.exception(), _ConnectionLost):
             return _STANDALONE
         request_id = message.id  # assigned by _submit
@@ -911,6 +986,9 @@ class ArbiterClient(_Base):
             future.cancel()
             self._abandon(request_id)
             raise
+        finally:
+            with self._state_lock:
+                self._waiters.pop(request_id or -1, None)
         if isinstance(reply, p.Error):
             raise error_from_wire(reply.code, reply.message, reply.detail)
         assert isinstance(reply, p.Granted)

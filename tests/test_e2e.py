@@ -312,3 +312,21 @@ async def test_status_through_the_client(daemon):
     assert status["models"][0]["measured"] == 4 * GiB
     assert status["foreign"] == [{"pid": 9999, "device": 0, "bytes": 2 * GiB}]
     assert {s["name"] for s in status["satellites"]} == {"a"}
+
+
+async def test_on_wait_reports_why_a_request_waits(daemon):
+    a = await daemon.client("a", pid=101)
+    b = await daemon.client("b", pid=202)
+    big = await register(a, "big", FakeWeights(daemon.gpu, 101, resident=20))
+    other = await register(b, "other", FakeWeights(daemon.gpu, 202, resident=10))
+    held = await asyncio.to_thread(big.acquire)
+    reasons: list[str] = []
+    attempt = asyncio.ensure_future(asyncio.to_thread(lambda: use(other, on_wait=reasons.append)))
+    await wait_for(lambda: reasons)
+    assert "waiting for a/big" in reasons[0]
+    held.release()
+    assert await attempt == "load"
+    assert any(r.startswith("evicting a/big") for r in reasons)
+    heard = len(reasons)
+    await asyncio.to_thread(use, other, on_wait=reasons.append)  # no wait, no callback
+    assert len(reasons) == heard
