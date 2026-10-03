@@ -7,7 +7,6 @@ import json
 import os
 import socket
 import stat
-import tempfile
 
 import pytest
 
@@ -17,16 +16,6 @@ from vrambiter.clock import FakeClock
 from vrambiter.gpu import FakeGpu
 from vrambiter.host import FakeHost
 from vrambiter.server import Server
-
-
-@pytest.fixture
-def sock_path():
-    # macOS limits Unix socket paths to ~104 bytes: keep it short.
-    d = tempfile.mkdtemp(dir="/tmp", prefix="vb")
-    yield os.path.join(d, "s.sock")
-    for name in os.listdir(d):
-        os.unlink(os.path.join(d, name))
-    os.rmdir(d)
 
 
 @pytest.fixture
