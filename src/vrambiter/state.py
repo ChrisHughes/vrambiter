@@ -79,6 +79,11 @@ class ModelRecord:
     pids: frozenset[int] = frozenset()
     evict_id: str | None = None
     evict_reason: str = ""
+    #: What the owner held, and what was free, when the eviction was sent (for settling).
+    evict_usage_before: int | None = None
+    evict_free_before: int = 0
+    #: Not a victim before this time (it just refused an eviction because a lease was arriving).
+    protected_until: float = 0.0
     load_started_at: float | None = None
     mismatch_logged: bool = False
 
@@ -114,7 +119,7 @@ class ModelRecord:
         """How much more than its idle size a lease may make this model hold."""
         return max(0, self.vram_peak - self.resident_estimate())
 
-    def view(self) -> ModelView:
+    def view(self, now: float = 0.0) -> ModelView:
         return ModelView(
             id=self.id,
             device=self.device,
@@ -127,6 +132,7 @@ class ModelRecord:
                 self.vram_peak if self.phase is Phase.LOADING else self.resident_estimate()
             ),
             unresponsive=self.unresponsive,
+            protected=now < self.protected_until,
         )
 
 
@@ -194,10 +200,12 @@ class Settle:
     def settled(self, gpu: GpuSnapshot, now: float) -> bool:
         if now >= self.deadline:
             return True
-        if self.pids and self.usage_before is not None:
-            usage_now = gpu.pid_usage(self.pids, self.device)
-            if usage_now == 0:
-                return True
+        if self.pids and gpu.pid_usage(self.pids, self.device) == 0:
+            return True  # the processes hold nothing on this device any more
+        if not self.expected:
+            # Only a reservation is held (a load was in flight): wait until the process's memory
+            # is gone, since "nothing returned yet" is indistinguishable from "nothing to return".
+            return False
         return self.returned(gpu) >= SETTLE_FRACTION * self.expected
 
 
@@ -349,6 +357,7 @@ def build_snapshot(
     headroom: int,
     host_headroom: int,
     max_concurrent_loads: int,
+    now: float = 0.0,
 ) -> Snapshot:
     """Combine bookkeeping and a measurement into the planner's input."""
     devices: dict[int, DeviceView] = {}
@@ -376,8 +385,10 @@ def build_snapshot(
             pending += sum(m.resident_estimate() for m in models if m.phase is Phase.EVICTING)
         for settle in registry.settling.values():
             if settle.device == device:
+                # A held reservation comes back when the settle ends, so it is pending too: the
+                # planner waits for it rather than failing or evicting around it.
                 reserved += settle.reserve
-                pending += settle.outstanding(gpu)
+                pending += settle.outstanding(gpu) + settle.reserve
         devices[device] = DeviceView(
             index=device,
             free=gpu.free[device],
@@ -397,7 +408,7 @@ def build_snapshot(
     loading = registry.loading()
     return Snapshot(
         devices=devices,
-        models=tuple(m.view() for m in sorted(registry.models.values(), key=lambda m: m.id)),
+        models=tuple(m.view(now) for m in sorted(registry.models.values(), key=lambda m: m.id)),
         headroom=headroom,
         host_available=host_available,
         host_headroom=host_headroom,

@@ -248,6 +248,7 @@ def test_rule4_equal_priority_is_eligible():
         busy("x/busy", 50),
         idle("x/pinned", 50, pinned=True),
         idle("x/unresponsive", 50, unresponsive=True),
+        idle("x/protected", 50, protected=True),
         idle("x/other-device", 50, device=1),
         loading("x/loading", 50),
         evicting("x/evicting", 50),
@@ -289,6 +290,12 @@ def test_rule5_load_in_flight_counts_as_could_free_later():
     s = snap(loading("b/l", 30), free=2, loads_in_flight=1, max_concurrent_loads=2)
     decision = plan(load(need=20), s)
     assert isinstance(decision, Wait) and decision.blockers == ("b/l",)
+
+
+def test_rule5_protected_model_counts_as_could_free_later():
+    s = snap(idle("a/just-refused", 30, protected=True), free=2)
+    decision = plan(load(need=20), s)
+    assert isinstance(decision, Wait) and decision.blockers == ("a/just-refused",)
 
 
 def test_rule5_busy_model_on_another_device_does_not_count():

@@ -180,6 +180,23 @@ def test_settle_by_free_memory_when_usage_unknown():
     assert s.settled(gpu(28, None), now=0)
 
 
+def test_reserve_only_settle_waits_for_the_process_memory_to_vanish():
+    s = Settle(
+        "S1",
+        "sat",
+        0,
+        frozenset({7}),
+        expected=0,
+        usage_before=0,
+        free_before=0,
+        deadline=100,
+        reserve=10 * GiB,
+    )
+    assert not s.settled(gpu(0, {7: 5 * GiB}), now=0)
+    assert s.settled(gpu(0, {}), now=0)
+    assert s.settled(gpu(0, {7: 5 * GiB}), now=100)
+
+
 def test_settle_deadline():
     s = Settle(
         "S1",
@@ -230,8 +247,8 @@ def test_build_snapshot_counts_reservations_pending_and_foreign():
     # s: envelope = 10 (loading peak) + 6 (evicting) = 16, usage 9 -> 7, capped by outstanding 10
     # plus the settle's 1 GiB reserve.
     assert dev.reserved == 7 * GiB + GiB
-    # pending: evicting 6 + settle outstanding 4 (free has not risen)
-    assert dev.pending == 6 * GiB + 4 * GiB
+    # pending: evicting 6 + settle outstanding 4 (free has not risen) + its 1 GiB reserve
+    assert dev.pending == 6 * GiB + 4 * GiB + GiB
     assert [(f.pid, f.bytes) for f in s.foreign] == [(999, 20 * GiB)]
     assert s.loads_in_flight == 1 and s.host_reserved == 4 * GiB
     assert {m.id for m in s.models} == {"s/load", "s/ev", "llama/g"}

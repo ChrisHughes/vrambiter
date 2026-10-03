@@ -25,11 +25,13 @@ THE RULES, in the order they are applied (docs/DESIGN.md, "Admission policy"):
 2. ``effective_free = free - reserved - headroom``. If ``need <= effective_free``: **Admit**.
 3. If evictions already in flight (``pending``) would cover it: **Wait** for them, evicting nothing
    more. Without this rule a slow driver turns one eviction into several.
-4. Victims are idle (resident, no leases), unpinned, responsive models on the same device whose
-   priority is ``<=`` the requester's, ordered by ``(priority, last_used, id)``. Take the shortest
-   prefix whose resident sizes cover the shortfall: **Evict**.
+4. Victims are idle (resident, no leases), unpinned, responsive (and not momentarily protected)
+   models on the same device whose priority is ``<=`` the requester's, ordered by
+   ``(priority, last_used, id)``. Take the shortest prefix whose resident sizes cover the
+   shortfall: **Evict**.
 5. If even every eligible victim is not enough: **Wait** if a busy or loading model on the device
-   could free memory later, else **Fail** naming the holders.
+   could free memory later (or one that is only momentarily protected), else **Fail** naming
+   the holders.
 
 :func:`plan_queue` applies ``plan`` to the whole wait queue in priority-then-FIFO order, with each
 waiting request earmarking the memory it is counting on so later requests can only use what is
@@ -96,6 +98,8 @@ class ModelView:
     #: Best estimate of the bytes evicting this model returns (measured, else declared).
     resident_bytes: int = 0
     unresponsive: bool = False
+    #: Briefly not evictable: it refused an eviction a moment ago because a lease was arriving.
+    protected: bool = False
 
     @property
     def busy(self) -> bool:
@@ -222,6 +226,7 @@ def eligible_victims(request: Request, snapshot: Snapshot) -> list[ModelView]:
         and m.idle
         and not m.pinned
         and not m.unresponsive
+        and not m.protected
         and m.priority <= request.priority
         and m.id != request.model_id
         and m.resident_bytes > 0  # evicting something that returns nothing only costs a reload
@@ -342,7 +347,7 @@ def plan(request: Request, snapshot: Snapshot) -> Decision:
         )
         return Wait(
             WaitKind.EVICTING,
-            f"waiting for {format_bytes(dev.pending)} to be returned by evictions in progress",
+            f"waiting for {format_bytes(dev.pending)} expected back from evictions in progress",
             evicting,
         )
 
@@ -363,7 +368,7 @@ def plan(request: Request, snapshot: Snapshot) -> Decision:
             for m in snapshot.models
             if m.device == request.device
             and m.id != request.model_id
-            and (m.busy or m.phase is Phase.LOADING)
+            and (m.busy or m.phase is Phase.LOADING or (m.idle and m.protected))
         )
     )
     if blockers:

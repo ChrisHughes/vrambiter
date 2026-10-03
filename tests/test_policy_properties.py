@@ -53,6 +53,7 @@ def models(draw, device_count: int):
                 last_used=float(draw(st.integers(0, 20))),
                 resident_bytes=draw(SIZE),
                 unresponsive=draw(st.integers(0, 5)) == 0,
+                protected=draw(st.integers(0, 5)) == 0,
             )
         )
     return tuple(out)
@@ -134,7 +135,7 @@ def test_victims_are_always_eligible(case):
             v = by_id[vid]
             assert v.phase is Phase.RESIDENT and v.leases == 0, "never evict busy work"
             assert not v.pinned, "never evict pinned"
-            assert not v.unresponsive
+            assert not v.unresponsive and not v.protected
             assert v.device == r.device
             assert v.priority <= r.priority
             assert v.id != r.model_id
@@ -196,7 +197,9 @@ def test_fail_and_wait_busy_are_justified(case):
     could_free_later = [
         m
         for m in s.models
-        if m.device == r.device and m.id != r.model_id and (m.busy or m.phase is Phase.LOADING)
+        if m.device == r.device
+        and m.id != r.model_id
+        and (m.busy or m.phase is Phase.LOADING or (m.idle and m.protected))
     ]
     eligible_total = sum(m.resident_bytes for m in eligible_victims(r, s))
     if isinstance(decision, Wait) and decision.kind is WaitKind.BUSY:
@@ -242,7 +245,7 @@ def test_queue_victims_distinct_and_eligible(case):
                 assert vid not in seen
                 seen.add(vid)
                 v = by_id[vid]
-                assert v.idle and not v.pinned and not v.unresponsive
+                assert v.idle and not v.pinned and not v.unresponsive and not v.protected
                 assert v.priority <= r.priority
 
 
