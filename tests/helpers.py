@@ -172,3 +172,31 @@ __all__ = [
     "wait_for",
     "os",
 ]
+
+
+def free_port() -> int:
+    """A TCP port that was free a moment ago (good enough for tests)."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # A zombie still answers kill(0); ask the process table when psutil is around.
+    try:
+        import psutil
+
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except Exception:
+        return True
+
+
+FAKES = os.path.join(os.path.dirname(__file__), "fakes")

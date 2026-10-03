@@ -67,11 +67,13 @@ __all__ = [
     "LoadResult",
     "ModelDriver",
     "ModelSpec",
+    "PollingDriver",
 ]
 
 log = logging.getLogger("vrambiter.arbiter")
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+#: Satellite names: they prefix model ids (``satellite/model``), so no slashes.
+NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 @dataclass
@@ -150,6 +152,14 @@ class ModelDriver(Protocol):
         ...
 
 
+class PollingDriver(ModelDriver, Protocol):
+    """A driver that can also report state changes it did not cause (llama-router)."""
+
+    async def poll(self) -> dict[str, bool] | None:
+        """``{model name: loaded?}`` for models whose state it knows, or ``None`` if unreachable."""
+        ...
+
+
 @dataclass
 class _ConnState:
     conn: Connection
@@ -201,6 +211,7 @@ class Arbiter:
         self._drivers: dict[str, ModelDriver] = {}
         #: Managed satellites' last resort after an eviction times out (SIGTERM, then SIGKILL).
         self._force_stop: dict[str, Callable[[], Awaitable[None]]] = {}
+        self._polling: set[str] = set()
         self._evict_timers: dict[str, TimerHandle] = {}
         self._seq = itertools.count(1)
         self._wake = asyncio.Event()
@@ -271,7 +282,7 @@ class Arbiter:
         self, name: str, driver: ModelDriver, models: list[ModelSpec], *, managed: bool
     ) -> None:
         """Declare a satellite whose models the arbiter loads itself through ``driver``."""
-        if not _NAME_RE.match(name):
+        if not NAME_PATTERN.match(name):
             raise ValueError(f"invalid satellite name {name!r}")
         sat = self.registry.satellites.setdefault(name, SatelliteRecord(name))
         sat.managed = managed
@@ -298,7 +309,7 @@ class Arbiter:
         self, name: str, force_stop: Callable[[], Awaitable[None]] | None = None
     ) -> None:
         """Declare a managed satellite that will connect and register its own models."""
-        if not _NAME_RE.match(name):
+        if not NAME_PATTERN.match(name):
             raise ValueError(f"invalid satellite name {name!r}")
         sat = self.registry.satellites.setdefault(name, SatelliteRecord(name))
         sat.managed = True
@@ -389,7 +400,7 @@ class Arbiter:
             state.name, state.role = msg.name or "control", "control"
             state.conn.send(p.Welcome(id=msg.id, satellite=state.name, arbiter_version=__version__))
             return
-        if not _NAME_RE.match(msg.name):
+        if not NAME_PATTERN.match(msg.name):
             raise ProtocolError(
                 f"invalid satellite name {msg.name!r}: letters, digits, '.', '_', '-'; no '/'"
             )
@@ -1035,9 +1046,31 @@ class Arbiter:
         def fire() -> None:
             self._poll_timer = None
             self.kick()
+            self._poll_drivers()
             self._schedule_poll()
 
         self._poll_timer = self.clock.call_later(self.settings.poll_interval_s, fire)
+
+    def _poll_drivers(self) -> None:
+        for name, driver in self._drivers.items():
+            poll = getattr(driver, "poll", None)
+            if poll is None or name in self._polling:
+                continue
+            self._polling.add(name)
+            self._spawn(self._run_driver_poll(name, poll), f"vrambiter-poll-{name}")
+
+    async def _run_driver_poll(
+        self, name: str, poll: Callable[[], Awaitable[dict[str, bool] | None]]
+    ) -> None:
+        try:
+            states = await poll()
+        except Exception:
+            log.debug("polling %s failed", name, exc_info=True)
+            return
+        finally:
+            self._polling.discard(name)
+        for model_name, loaded in (states or {}).items():
+            self.external_model_state(name, model_name, loaded)
 
     def _roots(self) -> dict[str, frozenset[int]]:
         roots: dict[str, frozenset[int]] = {}
