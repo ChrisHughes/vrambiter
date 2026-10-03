@@ -522,6 +522,25 @@ the standard library; `integrations/torch.py` never imports torch itself. The da
 - On a real GPU (`-m gpu`): a torch satellite allocates tensors, gets evicted, and NVML shows the
   memory returned.
 
+## Known limitations
+
+- **A cooperative load cannot be timed out by the arbiter.** The satellite owns it; a hung `load()`
+  keeps its reservation and the load slot until it returns or the satellite disconnects.
+  `status` shows how long each load has been running.
+- **Consumer leases on another cooperative satellite's models** are not supported yet (adapter-
+  backed and managed models only).
+- **A satellite started before the daemon stays standalone** (`connect()` returns a
+  `NullArbiter`); use `connect(wait_s=...)` or let the daemon start it.
+- **`vram_peak` is per model, not per lease.** Several concurrent leases on one model share its
+  peak; a satellite that runs several jobs on one model at once must declare a peak that covers
+  them.
+- **Attribution inside one process is approximate** (split by reports or declarations), and with
+  `max_concurrent_loads > 1` two router children starting at once can be attributed together.
+- **Priority can starve.** Under sustained load, low-priority requests may wait behind higher
+  ones until their timeout. That is the policy (priority, then FIFO), not a bug; use timeouts.
+- **Device indices are NVML's**; satellites should set `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+- **No authentication** beyond the socket's file permissions.
+
 ## Changes from the first draft
 
 - **Rule 0 (never fits) was added.** A request larger than `total - headroom` fails at once. The

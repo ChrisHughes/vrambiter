@@ -1478,6 +1478,13 @@ class Arbiter:
                     "estimate": model.resident_estimate(),
                     "host_peak": model.host_peak,
                     "idle_s": round(now - model.last_used, 1) if not model.leases else 0.0,
+                    # A load the arbiter cannot time out (the satellite owns it): make a hung one
+                    # visible.
+                    "loading_s": (
+                        round(now - model.load_started_at, 1)
+                        if model.load_started_at is not None
+                        else None
+                    ),
                     "unresponsive": model.unresponsive,
                 }
             )

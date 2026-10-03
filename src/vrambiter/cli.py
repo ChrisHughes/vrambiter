@@ -269,7 +269,9 @@ def render_status(status: dict[str, Any]) -> str:
                     format_bytes(m.get("vram_peak")),
                     str(m.get("priority", 0)),
                     "yes" if m.get("pinned") else "",
-                    _duration(m.get("idle_s")) if m["state"] in ("resident",) else "",
+                    _duration(m.get("idle_s"))
+                    if m["state"] == "resident"
+                    else (f"loading {_duration(m['loading_s'])}" if m.get("loading_s") else ""),
                 ]
             )
         out += _table(["MODEL", "STATE", "LEASES", "HOLDS", "PEAK", "PRIO", "PINNED", "IDLE"], rows)
