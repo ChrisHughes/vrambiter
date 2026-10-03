@@ -34,7 +34,8 @@ __all__ = [
 log = logging.getLogger("vrambiter.integrations.torch")
 
 
-def _torch() -> Any | None:
+def _torch() -> Any:
+    """The already-imported torch module, or ``None``. Never imports it."""
     return sys.modules.get("torch")
 
 

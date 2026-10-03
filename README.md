@@ -262,6 +262,7 @@ uv sync --extra dev --extra daemon
 uv run pytest                 # unit, property, end-to-end and subprocess tests; no GPU needed
 uv run pytest -m gpu          # on a CUDA machine with torch installed
 uv run ruff check && uv run ruff format --check
+uv run mypy
 ```
 
 ## License

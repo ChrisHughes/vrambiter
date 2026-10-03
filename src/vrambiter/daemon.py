@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+from collections.abc import Callable
 
 from .adapters.llama_router import LlamaRouterClient, LlamaRouterDriver
 from .arbiter import Arbiter
@@ -116,6 +117,12 @@ class Daemon:
         for sat in config.satellites:
             self._add(sat)
 
+    def _exit_callback(self, name: str) -> Callable[[int | None], None]:
+        def exited(_returncode: int | None) -> None:
+            self.arbiter.satellite_process_exited(name)
+
+        return exited
+
     def _add(self, sat: SatelliteConfig) -> None:
         process: ManagedProcess | None = None
         if sat.command:
@@ -132,7 +139,7 @@ class Daemon:
                     if sat.kill_grace_s is not None
                     else self.config.settings.kill_grace_s
                 ),
-                on_exit=lambda _rc, name=sat.name: self.arbiter.satellite_process_exited(name),
+                on_exit=self._exit_callback(sat.name),
             )
             self.processes[sat.name] = process
 

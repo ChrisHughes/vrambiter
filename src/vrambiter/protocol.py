@@ -19,6 +19,7 @@ Stdlib only: this module is imported by the client library.
 
 from __future__ import annotations
 
+import builtins
 import dataclasses
 import json
 from dataclasses import dataclass, field
@@ -88,7 +89,7 @@ class Message:
         return out
 
     @classmethod
-    def from_wire(cls: type[M], data: dict[str, Any]) -> M:
+    def from_wire(cls: builtins.type[M], data: dict[str, Any]) -> M:
         """Build from a decoded dict, ignoring unknown fields and type-checking known ones."""
         kwargs: dict[str, Any] = {}
         for f in dataclasses.fields(cls):

@@ -210,7 +210,7 @@ class Arbiter:
         self._conns: dict[int, _ConnState] = {}
         self._drivers: dict[str, ModelDriver] = {}
         #: Managed satellites' last resort after an eviction times out (SIGTERM, then SIGKILL).
-        self._force_stop: dict[str, Callable[[], Awaitable[None]]] = {}
+        self._force_stop: dict[str, Callable[[], Awaitable[object]]] = {}
         self._polling: set[str] = set()
         self._evict_timers: dict[str, TimerHandle] = {}
         self._seq = itertools.count(1)
@@ -306,7 +306,7 @@ class Arbiter:
             self.registry.models[record.id] = record
 
     def add_cooperative_satellite(
-        self, name: str, force_stop: Callable[[], Awaitable[None]] | None = None
+        self, name: str, force_stop: Callable[[], Awaitable[object]] | None = None
     ) -> None:
         """Declare a managed satellite that will connect and register its own models."""
         if not NAME_PATTERN.match(name):
@@ -981,8 +981,8 @@ class Arbiter:
                 reserve=reserve,
             )
         for q in [q for q in self.queue if q.model_id.startswith(sat.name + "/")]:
-            model = self.registry.models.get(q.model_id)
-            if model is not None and model.owner_kind is OwnerKind.COOPERATIVE:
+            queued = self.registry.models.get(q.model_id)
+            if queued is not None and queued.owner_kind is OwnerKind.COOPERATIVE:
                 self._dequeue(q)
                 self._reply_error(q, ArbiterError(f"{q.model_id}: its satellite went away"))
 

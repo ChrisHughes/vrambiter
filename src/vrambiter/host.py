@@ -148,13 +148,16 @@ def process_tree(pid: int) -> set[int]:
     try:
         import psutil
     except ImportError:
-        psutil = None  # type: ignore[assignment]
-    if psutil is not None:
-        try:
-            proc = psutil.Process(pid)
-            return {pid} | {child.pid for child in proc.children(recursive=True)}
-        except psutil.Error:
-            return {pid}
+        return _proc_tree(pid)
+    try:
+        proc = psutil.Process(pid)
+        return {pid} | {child.pid for child in proc.children(recursive=True)}
+    except psutil.Error:
+        return {pid}
+
+
+def _proc_tree(pid: int) -> set[int]:
+    """:func:`process_tree` without psutil: parse ``/proc/*/stat`` (Linux only)."""
     proc_dir = Path("/proc")
     if not proc_dir.is_dir():
         return {pid}
