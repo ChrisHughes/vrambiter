@@ -57,6 +57,8 @@ addopts = "-m 'not gpu'"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# Code blocks in the docs are hand-aligned for reading; keep the formatter out of them.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC"]
