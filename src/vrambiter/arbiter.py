@@ -1167,13 +1167,28 @@ class Arbiter:
                 for m in own:
                     if m.phase is Phase.RESIDENT and not m.leases:
                         usage = gpu.pid_usage(m.pids, device)
-                        if usage is not None:
+                        if usage:  # zero for a resident model means "cannot see it"
                             self._set_measured(m, usage)
                 own_pids = frozenset().union(*(m.pids for m in own)) if own else frozenset()
                 usage = gpu.pid_usage(pids - own_pids, device)
                 if usage is None:
                     continue
-                if all(m.phase is Phase.UNLOADED for m in shared):
+                resident = [m for m in shared if m.phase is not Phase.UNLOADED]
+                if usage == 0 and resident:
+                    # A process holding resident models holds at least a CUDA context. Zero means
+                    # the driver cannot see it (a PID namespace, say): measurements are unknown,
+                    # and declared sizes are used instead.
+                    if not sat.invisible_logged:
+                        sat.invisible_logged = True
+                        log.warning(
+                            "NVML shows no GPU memory for satellite %s (pid %s) although it has "
+                            "resident models; using declared sizes. Is it in another PID "
+                            "namespace (a container)?",
+                            sat.name,
+                            sat.pid,
+                        )
+                    continue
+                if not resident:
                     # Nothing resident: the baseline can only have shrunk (it is *learned* when
                     # an unload settles, see _settle; a satellite that has just connected may
                     # still be re-registering models it holds, so its usage proves nothing).

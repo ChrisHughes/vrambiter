@@ -159,6 +159,7 @@ class SatelliteRecord:
     baseline: dict[int, int] = field(default_factory=dict)
     #: Per-device bytes an eviction expected back but the driver never showed returned.
     residue: dict[int, int] = field(default_factory=dict)
+    invisible_logged: bool = False
 
     @property
     def connected(self) -> bool:

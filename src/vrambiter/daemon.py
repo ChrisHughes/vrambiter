@@ -16,14 +16,74 @@ from .arbiter import Arbiter
 from .client import default_socket_path
 from .clock import Clock
 from .config import Config, RestartPolicy, SatelliteConfig, SatelliteKind
-from .gpu import FakeGpu, GpuBackend, default_gpu_backend
+from .gpu import GpuBackend, default_gpu_backend
 from .host import HostBackend, default_host_backend
 from .managed import BlackBoxDriver, ManagedProcess
+from .policy import Phase
 from .server import Server
+from .state import Registry
 
-__all__ = ["Daemon", "run_daemon"]
+__all__ = ["Daemon", "SimulatedGpu", "run_daemon"]
 
 log = logging.getLogger("vrambiter.daemon")
+
+
+class SimulatedGpu:
+    """``--fake-gpu`` / ``gpu = "fake"``: one card whose usage is simulated from the models.
+
+    For trying vrambiter on a machine without an NVIDIA GPU (or with satellites that do not touch
+    one). A model counts its declared resident size while resident and its peak while loading or
+    leased, attributed to its satellite's pid, so admission, eviction and ``status`` behave as
+    they would on hardware. It reads the arbiter's registry from the measurement thread; a read
+    that races a mutation is simply retried.
+    """
+
+    def __init__(self, total: int, registry: Registry | None = None) -> None:
+        self.total = total
+        self.registry = registry
+
+    def devices(self) -> list[int]:
+        return [0]
+
+    def _usage(self) -> tuple[dict[int, int], int]:
+        for _ in range(10):
+            try:
+                return self._compute()
+            except RuntimeError:  # "dictionary changed size during iteration"
+                continue
+        return {}, 0
+
+    def _compute(self) -> tuple[dict[int, int], int]:
+        per_pid: dict[int, int] = {}
+        unattributed = 0
+        if self.registry is None:
+            return per_pid, unattributed
+        for model in list(self.registry.models.values()):
+            if model.phase is Phase.UNLOADED:
+                continue
+            busy = model.phase is Phase.LOADING or bool(model.leases)
+            nbytes = (
+                model.vram_peak
+                if busy
+                else (model.vram_resident or model.reported_bytes or model.vram_peak)
+            )
+            sat = self.registry.satellites.get(model.satellite)
+            pid = next(iter(model.pids), None) or (sat.pid if sat else None)
+            if pid:
+                per_pid[pid] = per_pid.get(pid, 0) + nbytes
+            else:
+                unattributed += nbytes
+        return per_pid, unattributed
+
+    def mem_info(self, device: int) -> tuple[int, int]:
+        per_pid, unattributed = self._usage()
+        return max(0, self.total - sum(per_pid.values()) - unattributed), self.total
+
+    def process_usage(self, device: int) -> dict[int, int] | None:
+        return self._usage()[0]
+
+    def close(self) -> None:
+        pass
 
 
 class Daemon:
@@ -38,12 +98,18 @@ class Daemon:
         clock: Clock | None = None,
     ) -> None:
         self.config = config
+        simulated: SimulatedGpu | None = None
         if gpu is None:
-            gpu = FakeGpu(config.fake_vram) if config.gpu == "fake" else default_gpu_backend()
+            if config.gpu == "fake":
+                gpu = simulated = SimulatedGpu(config.fake_vram)
+            else:
+                gpu = default_gpu_backend()
         self.gpu = gpu
         self.host = host or default_host_backend()
         self.socket_path = config.socket or default_socket_path()
         self.arbiter = Arbiter(self.gpu, self.host, settings=config.settings, clock=clock)
+        if simulated is not None:
+            simulated.registry = self.arbiter.registry
         self.server = Server(self.arbiter, self.socket_path, mode=config.socket_mode)
         self.processes: dict[str, ManagedProcess] = {}
         self._background: set[asyncio.Task[None]] = set()

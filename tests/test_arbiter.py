@@ -722,3 +722,16 @@ async def test_reconnecting_satellite_usage_is_not_mistaken_for_baseline(arb, gp
     a.request(p.Register(model="m", vram_peak=8 * GiB, state="resident", vram_bytes=8 * GiB))
     await arb.quiesce()
     assert arb.registry.models["a/m"].measured_bytes == 8 * GiB
+
+
+async def test_satellite_invisible_to_nvml_keeps_declared_sizes(arb, gpu, caplog):
+    """Zero usage for a process with resident models means NVML cannot see it (containers)."""
+    a = Sat(arb, gpu, "a", 100)
+    a.register("m", 10, resident=8)
+    g = await granted(arb, a, a.acquire("m"))
+    a.request(p.Loaded(model="m"))  # loaded, but nothing shows up under pid 100
+    a.request(p.Release(lease=g.lease))
+    await arb.quiesce()
+    model = arb.registry.models["a/m"]
+    assert model.measured_bytes is None and model.resident_estimate() == 8 * GiB
+    assert "NVML shows no GPU memory for satellite a" in caplog.text

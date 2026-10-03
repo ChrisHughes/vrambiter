@@ -282,3 +282,36 @@ async def test_daemon_stop_terminates_managed_processes(make, gpu):
     proc = daemon.processes["coop"]
     await daemon.stop()
     assert not proc.running
+
+
+async def test_simulated_gpu_makes_fake_mode_meaningful(sock_path):
+    """gpu = "fake": memory is simulated from declared sizes, so evictions happen for real."""
+    config = parse_config(
+        {"arbiter": {"socket": sock_path, "gpu": "fake", "fake_vram": "24GiB", "headroom": "0"}}
+    )
+    daemon = Daemon(config, host=FakeHost("64GiB"))
+    await daemon.start()
+    clients = []
+    try:
+        loaded = {"a": 0, "b": 0}
+        unloaded = {"a": 0, "b": 0}
+        ms = {}
+        for name in ("a", "b"):
+            c = await asyncio.to_thread(ArbiterClient, name, socket=sock_path)
+            clients.append(c)
+            ms[name] = await asyncio.to_thread(
+                c.register,
+                "m",
+                vram_peak="16GiB",
+                load=lambda n=name: loaded.__setitem__(n, loaded[n] + 1),
+                unload=lambda n=name: unloaded.__setitem__(n, unloaded[n] + 1),
+            )
+        await asyncio.to_thread(use, ms["a"])
+        await asyncio.to_thread(use, ms["b"])  # 16 + 16 > 24: a/m is evicted
+        assert unloaded == {"a": 1, "b": 0}
+        status = await asyncio.to_thread(clients[0].status)
+        assert status["devices"][0]["free"] == 8 * GiB
+    finally:
+        for c in clients:
+            c.close()
+        await daemon.stop()

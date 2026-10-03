@@ -66,7 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument(
         "--fake-gpu",
         metavar="SIZE",
-        help="use an in-memory fake GPU of SIZE (try vrambiter without NVIDIA hardware)",
+        help="simulate one GPU of SIZE from the models' declared sizes (try vrambiter without "
+        "NVIDIA hardware)",
     )
     d.add_argument("--log-level", default=None, help="debug, info, warning (default: config)")
 

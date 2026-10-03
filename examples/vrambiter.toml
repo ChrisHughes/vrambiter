@@ -1,0 +1,66 @@
+# An example vrambiter.toml: llama-server in router mode, a cooperative satellite, a black box.
+#
+#   vrambiter daemon --config examples/vrambiter.toml
+#
+# Sizes accept GiB/GB/MiB/... (GB = 10^9, GiB = 2^30). Unknown keys are errors.
+
+[arbiter]
+# socket = "/run/user/1000/vrambiter.sock"   # default: $XDG_RUNTIME_DIR/vrambiter.sock
+headroom = "2GiB"             # never plan into the last 2 GiB of each GPU
+host_headroom = "3GiB"        # ...or the last 3 GiB of host RAM
+max_concurrent_loads = 1      # loads stage weights through host RAM: one at a time
+poll_interval_s = 1.0         # NVML poll, catches memory moved by processes vrambiter doesn't know
+evict_timeout_s = 30
+kill_grace_s = 10             # managed processes: SIGTERM, then SIGKILL after this
+
+[profiles.party]              # `vrambiter profile party` pins these (glob on model ids)
+pin = ["tts/*", "llama/gemma-4-26b"]
+
+# llama.cpp's llama-server in router mode. vrambiter runs it (so it can attribute each model's
+# child process to it) and loads/unloads models through POST /models/load and /models/unload.
+[[satellite]]
+name = "llama"
+adapter = "llama-router"
+url = "http://127.0.0.1:8000"
+command = [
+  "/opt/llama.cpp/build/bin/llama-server",
+  "--models-preset", "/etc/vrambiter/models.ini",
+  "--models-max", "0",          # no router-side LRU: vrambiter decides what to evict
+  "--no-models-autoload",       # requests must not load models behind the arbiter's back
+  "--host", "127.0.0.1", "--port", "8000",
+]
+autostart = true              # start the router at daemon start (it loads nothing by itself)
+restart = "on-failure"
+
+  [[satellite.model]]
+  name = "gemma-4-26b"        # vrambiter id: llama/gemma-4-26b
+  router_model = "gemma-4-26b" # the section name in models.ini (default: same as name)
+  vram_peak = "30GiB"         # weights + KV cache at the configured context, rounded up
+  host_peak = "2GiB"          # mmap'd GGUF: little host RAM needed
+
+  [[satellite.model]]
+  name = "qwen3-8b"
+  vram_peak = "9GiB"
+
+# A cooperative satellite: imports vrambiter and registers its own models. The daemon starts it
+# with VRAMBITER_SOCKET and VRAMBITER_NAME=tts set and restarts it if it crashes.
+[[satellite]]
+name = "tts"
+command = ["/srv/tts/.venv/bin/python", "/srv/tts/server.py", "--port", "8101"]
+cwd = "/srv/tts"
+env = { CUDA_DEVICE_ORDER = "PCI_BUS_ID" }
+
+# A black box: a server that knows nothing about vrambiter. Loading = starting it (and waiting
+# for health_url), evicting = stopping it. Exactly one model per black box.
+[[satellite]]
+name = "comfy"
+command = ["/srv/comfy/.venv/bin/python", "main.py", "--port", "8188"]
+cwd = "/srv/comfy"
+health_url = "http://127.0.0.1:8188/"
+autostart = false             # start on first lease (e.g. `vrambiter warm comfy/sdxl`)
+
+  [[satellite.model]]
+  name = "sdxl"
+  vram_peak = "17GiB"
+  vram_resident = "8GiB"
+  host_peak = "14GiB"
