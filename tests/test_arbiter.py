@@ -735,3 +735,25 @@ async def test_satellite_invisible_to_nvml_keeps_declared_sizes(arb, gpu, caplog
     model = arb.registry.models["a/m"]
     assert model.measured_bytes is None and model.resident_estimate() == 8 * GiB
     assert "NVML shows no GPU memory for satellite a" in caplog.text
+
+
+async def test_reconnect_to_same_arbiter_drops_stale_settles(arb, gpu):
+    """A satellite whose socket dropped but whose process lives on comes back holding its
+    model: nothing is 'returning', so nothing should be waited for."""
+    a = Sat(arb, gpu, "a", 100)
+    await resident(arb, a, "m1", 8)
+    await resident(arb, a, "m2", 8)
+    a.disconnect()
+    assert len(arb.registry.settling) == 1  # one settle for the whole process
+    assert next(iter(arb.registry.settling.values())).expected == 16 * GiB
+    again = Sat(arb, gpu, "a", 100)
+    for name in ("m1", "m2"):
+        again.request(p.Register(model=name, vram_peak=8 * GiB, state="resident"))
+    assert arb.registry.settling == {}
+    b = Sat(arb, gpu, "b", 200)
+    b.register("n", 10)  # 8 free: one of a's models must go
+    rid = b.acquire("n")
+    await arb.quiesce()
+    [ev] = again.evicts()  # evicts straight away instead of waiting on a phantom return
+    again.evicted(ev, free=8)
+    await granted(arb, b, rid)

@@ -317,11 +317,10 @@ class Arbiter:
             self._force_stop[name] = force_stop
 
     def satellite_process_exited(self, name: str) -> None:
-        """A driven satellite's process died (or was stopped): its models are gone."""
-        now = self.clock.now()
-        for model in self.registry.models_of(name):
-            if model.phase is not Phase.UNLOADED:
-                self._model_gone(model, now, reason=f"{name} exited")
+        """A managed satellite's process died (or was stopped): its models are gone."""
+        sat = self.registry.satellites.get(name)
+        if sat is not None:
+            self._release_satellite_memory(sat, self.clock.now(), reason=f"{name} exited")
         self._bump()
         self.kick()
 
@@ -387,7 +386,7 @@ class Arbiter:
             return
         log.info("satellite %s disconnected", sat.name)
         sat.conn_id = None
-        self._release_satellite_memory(sat, now)
+        self._release_satellite_memory(sat, now, reason=f"{sat.name} disconnected")
         self._bump()
         self.kick()
 
@@ -459,6 +458,9 @@ class Arbiter:
         adopted: list[str] = []
         if fresh and msg.state == "resident":
             # Re-registration after a reconnect or an arbiter restart: believe the satellite.
+            # Whatever we expected back from its previous connection is not coming: it is here.
+            for key in [k for k, v in self.registry.settling.items() if v.satellite == state.name]:
+                del self.registry.settling[key]
             model.phase = Phase.RESIDENT
             model.reported_bytes = msg.vram_bytes
             model.measured_bytes = None
@@ -891,9 +893,12 @@ class Arbiter:
         model.unresponsive = True  # keep evict_id: a late `evicted` is still accepted
         self.kick()
 
-    def _model_gone(self, model: ModelRecord, now: float, reason: str) -> None:
+    def _model_gone(
+        self, model: ModelRecord, now: float, reason: str, *, settle: bool = True
+    ) -> None:
         """A model's memory is going away without an eviction round trip (unloaded voluntarily,
-        owner disconnected, process exited). Ends its leases and expects its memory back."""
+        owner disconnected, process exited). Ends its leases and expects its memory back
+        (unless ``settle=False``: the caller accounts for a whole satellite at once)."""
         sat = self.registry.satellites.get(model.satellite)
         self._cancel_evict_timer(model)
         reserve = 0
@@ -906,7 +911,7 @@ class Arbiter:
         if self._last is not None:
             usage = self._last.gpu.pid_usage(pids, model.device) if pids else None
             free = self._last.gpu.free.get(model.device, 0)
-        if expected or reserve:
+        if settle and (expected or reserve):
             self._add_settle(
                 sat_name=model.satellite,
                 device=model.device,
@@ -942,10 +947,39 @@ class Arbiter:
                 self._dequeue(q)
                 self._reply_error(q, ArbiterError(f"{model.id}: its satellite went away"))
 
-    def _release_satellite_memory(self, sat: SatelliteRecord, now: float) -> None:
+    def _release_satellite_memory(self, sat: SatelliteRecord, now: float, reason: str) -> None:
+        """Everything a satellite held is going away: one settle per device for the lot, since
+        its processes' usage is shared by all its models."""
+        totals: dict[int, list[int]] = {}  # device -> [expected, reserve]
         for model in self.registry.models_of(sat.name):
-            if model.phase is not Phase.UNLOADED:
-                self._model_gone(model, now, reason=f"{sat.name} disconnected")
+            if model.phase is Phase.UNLOADED or model.pids:
+                if model.phase is not Phase.UNLOADED:
+                    self._model_gone(model, now, reason=reason)  # its own processes
+                continue
+            entry = totals.setdefault(model.device, [0, 0])
+            if model.phase is Phase.LOADING:
+                entry[1] += model.vram_peak
+            else:
+                entry[0] += model.resident_estimate()
+            self._model_gone(model, now, reason=reason, settle=False)
+        pids = sat.all_pids()
+        for device, (expected, reserve) in totals.items():
+            if not (expected or reserve):
+                continue
+            usage = free = None
+            if self._last is not None:
+                usage = self._last.gpu.pid_usage(pids, device) if pids else None
+                free = self._last.gpu.free.get(device, 0)
+            self._add_settle(
+                sat_name=sat.name,
+                device=device,
+                pids=pids,
+                expected=expected,
+                usage_before=usage,
+                free_before=free or 0,
+                model_id=None,
+                reserve=reserve,
+            )
         for q in [q for q in self.queue if q.model_id.startswith(sat.name + "/")]:
             model = self.registry.models.get(q.model_id)
             if model is not None and model.owner_kind is OwnerKind.COOPERATIVE:
