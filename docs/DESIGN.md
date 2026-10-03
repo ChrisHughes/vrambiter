@@ -15,6 +15,9 @@ processes keeps that behaviour and fixes what in-process arbitration cannot:
 - **Each server keeps its own dependencies.** A TTS model pinned to torch 2.9, a speech
   recogniser with its own CUDA libraries and a llama.cpp binary can share one card.
 
+This document describes the implementation as built. Where it departs from the first draft of the
+design, the change and the reason are listed at the end ("Changes from the first draft").
+
 ## Goals and non-goals
 
 Goals:
@@ -38,11 +41,12 @@ replacing an inference server.
 |---|---|
 | **arbiter** | the daemon (`vrambiter daemon`). One per machine. Owns the policy and the truth. |
 | **satellite** | a process that talks to the arbiter. Usually a model server. |
-| **model** | the unit of eviction: something a satellite can load and unload. |
+| **model** | the unit of eviction: something a satellite can load and unload. Id: `satellite/model`. |
 | **lease** | a claim that a model is in use right now. A model with leases is busy. |
-| **admission** | permission to load: the arbiter has made (or found) room in VRAM and host RAM. |
+| **admission** | permission to load (or to work): the arbiter has made (or found) room. |
 | **pinned** | never evicted. |
 | **foreign** | GPU memory held by a process the arbiter does not know. Counted, never evicted. |
+| **settle** | the window after an eviction or exit in which freed memory is expected back. |
 
 ## Satellite kinds
 
@@ -50,14 +54,16 @@ replacing an inference server.
    around work, and unloads a model when the arbiter sends `evict`. Fine-grained: a satellite with
    three models can give back one.
 2. **Managed.** The arbiter starts the process from its config. It may also be cooperative (the
-   arbiter sets `VRAMBITER_SOCKET` in its environment), or a black box the arbiter can only start,
-   stop (SIGTERM, then SIGKILL) and measure through NVML.
+   arbiter sets `VRAMBITER_SOCKET` and `VRAMBITER_NAME` in its environment), or a black box the
+   arbiter can only start, stop (SIGTERM, then SIGKILL) and measure through NVML. A black box is
+   exactly one model: loading it is starting the process (and waiting for its health check),
+   evicting it is stopping it.
 3. **Adapter-backed.** A built-in adapter speaks a server's own API on the satellite's behalf. The
    first is `llama-router`: llama.cpp's `llama-server` in router mode loads and unloads models
    through `POST /models/load` and `POST /models/unload`, each model in its own child process.
 
-Consumers that call an adapter-backed model (for example an app sending chat requests to
-llama-server) take a lease on it by its full id, `llama/gemma-4-26b`, so the arbiter knows it is
+Consumers that call an adapter-backed or managed model (for example an app sending chat requests
+to llama-server) take a lease on it by its full id, `llama/gemma-4-26b`, so the arbiter knows it is
 busy and loads it if needed.
 
 ## Model state machine
@@ -71,16 +77,25 @@ busy and loads it if needed.
     │                                     (lease)   BUSY ───────┘
     │          evicted / unloaded / owner gone       │
     └───────────────────── EVICTING ◄── evict ── RESIDENT (idle, not pinned)
+                              │
+                              └── evict_refused ──► RESIDENT (protected for a moment)
+                              └── evict timeout ──► RESIDENT, unresponsive
 ```
 
-- `RESIDENT` with zero leases is **idle** and evictable unless pinned.
-- `BUSY` means one or more leases. Never evicted.
-- `LOADING` holds a **reservation** of `vram_peak` against free memory until the satellite reports
-  `loaded`, so two admissions cannot both count the same free gigabytes.
+- `RESIDENT` with zero leases is **idle** and evictable unless pinned. `BUSY` is not a separate
+  phase in the code: it is `RESIDENT` with leases. Never evicted.
+- `LOADING` holds a **reservation** against free memory until the satellite reports `loaded`, so
+  two admissions cannot both count the same free gigabytes (see "Reservations").
+- After `evict_refused` (a lease arrived first), the model is *protected* for `refuse_cooldown_s`
+  (2 s) so the next planning pass does not immediately evict it again.
+- If an eviction is not answered within `evict_timeout_s`, the model goes back to `RESIDENT` marked
+  **unresponsive**: excluded from victim selection until the satellite talks to the arbiter again
+  (a late `evicted` is still accepted, as is the owner's next `acquire`).
 - When a satellite disconnects, all its leases end and its models go to `UNLOADED`. The arbiter
-  confirms through NVML that the process's memory is gone before releasing the reservation.
+  confirms through NVML that the process's memory is gone before releasing what it reserved
+  (see "Settling").
 
-## Sizes
+## Sizes and measurement
 
 Each model declares:
 
@@ -95,85 +110,174 @@ Each model declares:
 **A declared size is a peak, not a residency.** A model that declares 34 GB and holds 29.7 GB while
 idle is behaving correctly. The arbiter keeps both numbers and uses each where it belongs.
 
-Measurement: after `loaded`, the satellite may report the bytes it holds (for PyTorch,
-`torch.cuda.memory_reserved()`); the arbiter also reads NVML per-process usage. For a single-model
-satellite the NVML number wins. For a multi-model satellite the process total is split among its
-models using their reports or declarations. A mismatch above 20% is logged, never fatal.
+What a model holds while idle (its *resident estimate*) is, in order of preference: the measured
+figure, the satellite's own report, `vram_resident`, `vram_peak`.
+
+Measurement: with `loaded`, the satellite may report the bytes it holds (for PyTorch the client
+reports the growth of `torch.cuda.memory_reserved()` across `load()`); the arbiter also reads NVML
+per-process usage of the satellite's process tree every poll, and while a satellite's models are
+all idle it attributes that usage to them:
+
+- one resident model takes the satellite's usage minus its **baseline** (the CUDA context and
+  allocator floor). The baseline is learned when an unload settles with nothing left resident; it
+  is never learned from a satellite that has just connected, since it may be re-registering models
+  it still holds.
+- several resident models split it in proportion to their reports or declarations.
+- models that run in their own processes (llama-router instances) are measured exactly, by pid.
+- a mismatch above 20% against the declaration is logged once, never fatal.
+- usage of exactly zero for a process with resident models means NVML cannot see it (a container
+  in its own PID namespace, typically): measurements are treated as unknown, declared sizes are
+  used, and this is logged once.
+
+Measurements are not taken while a satellite has a model loading or leased, since the process total
+then includes transient working memory that is nobody's residency.
+
+## Reservations
+
+Reserved memory is subtracted from free memory before any admission. It covers loads in flight and
+the working headroom of busy models, and it is computed per satellite process as an **envelope**:
+
+```
+envelope    = Σ peak of loading models + Σ max(peak, resident) of busy models
+              + Σ resident of idle models
+outstanding = Σ peak of loading models + Σ (peak - resident) of busy models
+reserved    = clamp(envelope - usage_of_the_process, 0, outstanding)
+```
+
+So a load reserves its full peak at first and less as it allocates (no double counting of what the
+driver already shows as used), and a leased model keeps the room it may still grow into while it
+works. When per-process usage is unknown, `outstanding` is reserved in full. Requests for a lease
+on an idle resident model ask for its working headroom (`peak - resident`); a second lease on a
+busy model asks for nothing.
 
 ## Admission policy
 
-Pure function in `policy.py`, the most heavily tested code in the project:
+Pure functions in `policy.py`, the most heavily tested code in the project:
 
 ```
-plan(request, snapshot) -> Admit | Evict(victims) | Wait(reason) | Fail(VramUnavailable)
+plan(request, snapshot) -> Admit | Evict(victims) | Wait(kind, reason) | Fail(VramUnavailable)
+plan_queue(requests, snapshot) -> [(request, decision)]
 ```
 
-Inputs: the requested model and its priority, current NVML free memory per device, outstanding
-reservations, every model's state, leases, pins, priority and `last_used`, host `MemAvailable`,
-and loads in flight.
+Inputs: the requested model, its priority and need, current NVML free memory per device,
+reservations, memory expected back (`pending`: evictions in flight and settling), every model's
+state, leases, pins, priority, `last_used` and resident estimate, host `MemAvailable`, loads in
+flight and the host peaks they reserved.
 
-1. `effective_free = nvml_free - reservations - headroom`.
-2. If `vram_peak <= effective_free`, and host RAM and load concurrency allow it: **Admit**.
-3. Otherwise choose **victims** from idle, unpinned models on the same device whose priority is
-   `<=` the requester's, ordered by `(priority asc, last_used asc)`. Take the shortest prefix whose
-   resident sizes cover the shortfall. If that covers it: **Evict(victims)**, then re-plan after
-   the evictions are confirmed.
-4. If evicting every eligible victim still is not enough:
-   - if any busy model (or any load in flight) could free memory later: **Wait** (queue).
+0. If `need > total - headroom`, nothing could ever make room: **Fail** immediately.
+1. Loads pass the **host gate** first: if `loads_in_flight >= max_concurrent_loads`, **Wait**; if
+   `host_peak > MemAvailable - host_headroom - Σ host_peak of loads in flight`, **Wait** when a
+   load is in flight, else **Fail** (`HostRamUnavailable`). The gate comes before any eviction, so
+   the arbiter never evicts models for a load that could not start anyway.
+2. `effective_free = nvml_free - reserved - headroom`. If `need <= effective_free`: **Admit**.
+3. If `need <= effective_free + pending`: **Wait** for the memory already on its way, evicting
+   nothing more. (Without this rule a driver slow to return pages turns one eviction into several.)
+4. Otherwise choose **victims** from idle, unpinned, responsive, unprotected models on the same
+   device whose priority is `<=` the requester's, ordered by `(priority asc, last_used asc, id)`.
+   Take the shortest prefix whose resident estimates cover the shortfall: **Evict(victims)**, then
+   re-plan once the evictions are confirmed.
+5. If evicting every eligible victim still is not enough:
+   - if anything on the device could change that (a busy, loading, evicting or momentarily
+     protected model, or memory still returning): **Wait** (queue).
    - else: **Fail** with `VramUnavailable(need, free, holders)`, a structured error that names
-     what holds the memory, including foreign processes.
-5. Host RAM: if `host_peak > MemAvailable - host_headroom`, or `loads_in_flight >= max_concurrent_loads`:
-   **Wait** for the in-flight load to finish (or Fail if none is in flight and RAM is still short).
+     what holds the memory: models with their state, pins and priorities, foreign processes, and
+     whatever the driver counts as used that nobody claims.
 
-Waiting is **event-driven**: every release, `loaded`, `evicted`, disconnect and each NVML poll
-(default every 1 s, to catch memory moved by foreign processes) re-plans the queue. The queue is
-ordered by priority, then FIFO. A request may carry a timeout; expiry fails it with
-`VramUnavailable`.
+Waiting is **event-driven**: every acquire, release, `loaded`, `evicted`, refusal, disconnect,
+settle check and each NVML poll (default every 1 s, to catch memory moved by foreign processes)
+wakes a single planning task, which measures (in a worker thread) and re-plans the whole queue.
+Only requests that arrived before the measurement started are planned in a pass, so no admission is
+ever made on numbers older than the request.
+
+**The queue** is planned by `plan_queue` in priority order, then FIFO, against a working copy of the
+snapshot that each decision updates: an admission reserves its need and takes a load slot; an
+eviction marks its victims; a request left waiting on VRAM *earmarks* the room it is counting on,
+so later requests may **backfill** into what remains but never take an earlier request's room; a
+load left waiting at the host gate holds back later loads, so loads start in queue order; and a
+request that would fail while requests ahead of it on the same device are still waiting waits
+instead, since their admission changes the picture. A request may carry a timeout; expiry fails it
+with `VramUnavailable` naming the holders. `wait=False` (or a zero timeout) fails instead of
+waiting, but still lets evictions run.
 
 ## Eviction
 
-1. The arbiter marks the victim `EVICTING` and sends `evict` to its owner.
+1. The arbiter marks the victim `EVICTING` and sends `evict` to its owner (or calls the adapter, or
+   stops the black-box process).
 2. A cooperative owner unloads it (its `unload` callback; the library then runs `gc.collect()` and
    `torch.cuda.empty_cache()` if torch is loaded) and replies `evicted`, or replies
-   `evict_refused` if a lease arrived first (the model goes back to `BUSY`).
+   `evict_refused` if a lease arrived first (the model goes back to `RESIDENT`, protected briefly)
+   or if `unload` raised.
 3. If no reply arrives within `evict_timeout` (default 30 s):
-   - managed process: SIGTERM, then SIGKILL after `kill_grace`, only when the model is that
-     process's only model or policy `kill_on_evict_timeout` is set.
+   - managed process: SIGTERM to its process group, then SIGKILL after `kill_grace`, only when the
+     model is that process's only resident model or policy `kill_on_evict_timeout` is set.
    - otherwise: the model is marked `unresponsive` and excluded from victim selection, and the
      request re-plans.
-4. After `evicted`, the arbiter waits for NVML to show the memory returned (up to a few seconds)
-   before treating the room as free. A satellite whose memory does not come back is reported
-   (`status` shows the residue); it is not punished.
+4. After `evicted`, the model is `UNLOADED` but its memory is counted as **settling** (see below)
+   until NVML shows it returned, so the room is not double-counted and no extra victims are taken
+   meanwhile. A satellite whose memory does not come back is reported (`status` shows the residue);
+   it is not punished.
+
+### Settling
+
+A settle record is created for every eviction, voluntary `unloaded`, disconnect and process exit.
+Until it settles, its outstanding bytes count as *pending* (rule 3) and a load that was in flight
+keeps its reservation. It settles when the processes involved hold nothing on the device, when 80%
+of the expected bytes are back (by per-process usage, else by free memory), or after
+`settle_timeout_s` (5 s), at which point any shortfall is recorded as residue. A disconnect or exit
+creates one record for the whole satellite (its models share one process's usage). A satellite that
+reconnects and re-registers a resident model drops its old records: that memory is in use, not
+returning.
 
 ## Protocol
 
-Newline-delimited JSON over a Unix domain socket (default `$XDG_RUNTIME_DIR/vrambiter.sock`,
-override with `VRAMBITER_SOCKET`). Requests carry an `id`; responses echo it. The arbiter can send
-unsolicited messages (`evict`, `notice`) at any time.
+Newline-delimited JSON over a Unix domain socket (default `$XDG_RUNTIME_DIR/vrambiter.sock`, else
+`/tmp/vrambiter-$UID.sock`; override with `VRAMBITER_SOCKET`). The socket is created mode 0600:
+whoever can connect can evict models. Requests carry an integer `id`; responses echo it. The
+arbiter can send unsolicited messages (`evict`, `notice`) at any time. Lines are limited to 1 MiB.
 
 ```
-client -> arbiter                               arbiter -> client
-hello    {name, pid, version, protocol}    ->   welcome {satellite, protocol, arbiter_version}
-register {model, device, vram_peak, ...}   ->   ok | error
-acquire  {model, wait, timeout_s}          ->   granted {lease, action: "load"|"ready"} | error
-loaded   {model, vram_bytes?}              ->   ok
-load_failed {model, error}                 ->   ok
-release  {lease}                           ->   ok
-unloaded {model}                           ->   ok           (voluntary unload)
-evicted  {model, evict_id}                 ->   ok
-evict_refused {model, evict_id, reason}    ->   ok
-pin / unpin {model}                        ->   ok
-status   {}                                ->   status {devices, models, satellites, queue, foreign}
-                                            <-  evict  {evict_id, model, reason}
-                                            <-  notice {kind, ...}
+client -> arbiter                                 arbiter -> client
+hello    {name, pid, version, protocol, role}  ->   welcome {satellite, protocol, arbiter_version}
+register {model, device, vram_peak, vram_resident?, host_peak, priority, pinned,
+          state, vram_bytes?, leases}          ->   ok {model, leases?} | error
+acquire  {model, wait, timeout_s?}             ->   granted {lease, action: "load"|"ready", model}
+                                                    | error
+cancel   {request}                             ->   ok   (the acquire also gets error "cancelled")
+loaded   {model, vram_bytes?}                  ->   ok
+load_failed {model, error}                     ->   ok
+release  {lease}                               ->   ok   (idempotent)
+unloaded {model}                               ->   ok   (voluntary unload)
+evicted  {model, evict_id}                     ->   ok
+evict_refused {model, evict_id, reason}        ->   ok
+pin / unpin {model}                            ->   ok {model}
+evict_model {model}                            ->   ok {model} | error   (operator: evict if idle)
+profile  {name}                                ->   ok | error           ("" clears)
+status   {}                                    ->   status {arbiter, devices, host, models,
+                                                            satellites, queue, foreign}
+                                               <-   evict  {evict_id, model, reason}
+                                               <-   notice {kind, message, data}
 ```
+
+- `role` is `"satellite"` (default) or `"control"` (the CLI): control connections may acquire
+  (consumer leases), pin, evict, switch profiles and ask for status, but do not register models and
+  are not listed as satellites.
+- `register` with `state: "resident"`, `vram_bytes` and `leases: n` is how a satellite re-registers
+  after a reconnect or an arbiter restart: the arbiter believes it, marks the model resident and
+  busy, and returns `n` adopted lease ids in `ok.leases` so the satellite's later `release`s match.
+- A satellite addresses its own models by short name and any model by full id.
+- Error replies are `{type: "error", id, code, message, detail}`. Codes: `vram_unavailable`,
+  `host_ram_unavailable` (both with `detail` = need, free, reason, holders), `unknown_model`,
+  `registration_error`, `name_in_use`, `protocol_error`, `unknown_type`, `arbiter_error`,
+  `internal_error`. The client maps them back to exception classes.
+- `notice` kinds: `lease_lost` (a consumer's lease ended because the model's process went away).
 
 `acquire` on a model the caller does not own (a consumer lease) is allowed for adapter-backed and
-managed models: the arbiter loads it through the adapter if needed and replies `ready` when it is
-resident. Consumer leases on another cooperative satellite's models are a later extension.
+managed models: the arbiter loads it through the adapter or by starting the process if needed and
+replies `ready` when it is resident. Consumer leases on another cooperative satellite's models are a
+later extension.
 
-Protocol version starts at 1. Unknown fields are ignored; unknown message types get an `error`
-reply, never a disconnect.
+Protocol version is 1. Unknown fields are ignored; unknown message types get an `error` reply,
+never a disconnect.
 
 ## Client library
 
@@ -199,20 +303,31 @@ with arb.lease("llama/gemma-4-26b"):   # consumer lease on an adapter-backed mod
     reply = httpx.post(...)
 ```
 
+- `connect()` returns an `ArbiterClient`, or a `NullArbiter` when no daemon answers.
+  `$VRAMBITER_NAME` overrides the name given in code (so a launcher picks the identity),
+  `wait_s` waits for a daemon that is still starting, `required=True` raises
+  `ArbiterUnavailable` instead of falling back.
 - The client runs one background thread with its own event loop and a single socket. Sync and
-  async APIs bridge into it. `load` and `unload` run under a per-model lock, so an eviction can
-  never race a lease.
-- Local lease counting: the client knows its own leases and answers `evict_refused` immediately
-  when the model is in use locally.
+  async APIs bridge into it. Messages are written in the order they are submitted (submission is
+  `call_soon_threadsafe`, never a task that might run later), which is what keeps `loaded` ahead of
+  `release` and `evicted` ahead of the next `acquire`.
+- `load` and `unload` run under a per-model lock, and the lease path takes the same lock to check
+  residency, so an eviction can never race a lease: a lease that arrives during an unload waits for
+  it and then loads again. For `alease()`, `load` runs in a worker thread.
+- Local lease counting: a lease is counted locally *before* its `acquire` is sent, and an `evict`
+  that finds the count non-zero is answered `evict_refused` immediately. This holds even when the
+  arbiter's view is stale.
+- Cancelling an async acquire (or interrupting a sync one) sends `cancel`; a grant already on its
+  way is released on arrival.
 - **Standalone mode** (`NullArbiter`): `lease()` loads on first use and never unloads. Behaviour
-  without an arbiter is exactly what a plain server would do. `vrambiter.connect(required=True)`
-  raises instead.
-- If the arbiter goes away mid-run, the client falls back to standalone behaviour and reconnects
-  in the background, re-registering its models with their current state.
+  without an arbiter is exactly what a plain server would do.
+- If the arbiter goes away mid-run, the client falls back to standalone behaviour and reconnects in
+  the background with backoff, re-registering its models with their current state and live lease
+  counts. A model the new arbiter rejects stays usable standalone; the others coordinate.
 
 ## Managed processes and configuration
 
-`vrambiter.toml`:
+`vrambiter.toml` (parsed strictly: an unknown key is an error, and every error names its location):
 
 ```toml
 [arbiter]
@@ -222,6 +337,8 @@ host_headroom = "3GiB"
 max_concurrent_loads = 1
 poll_interval_s = 1.0
 evict_timeout_s = 30
+# settle_timeout_s = 5, refuse_cooldown_s = 2, kill_grace_s = 10, kill_on_evict_timeout = false,
+# socket_mode = "0600", log_level = "info", gpu = "nvml" | "fake", fake_vram = "24GiB"
 
 [profiles.party]                # `vrambiter profile party` pins these
 pin = ["cerberus-tts/*", "cerberus-stt/*", "llama/gemma-4-26b"]
@@ -236,6 +353,7 @@ autostart = true
   [[satellite.model]]
   name = "gemma-4-26b"
   vram_peak = "30GiB"
+  # router_model = "ggml-org/gemma-4-26b:Q4_K_M"   # llama-server's id, if different
 
 [[satellite]]
 name = "cerberus-tts"
@@ -243,26 +361,69 @@ command = ["/home/me/cerberus/services/tts/.venv/bin/cerberus-tts", "--port", "8
 autostart = true                # cooperative: registers its own models over the socket
 ```
 
+A satellite's kind is inferred: `adapter` makes it adapter-backed; a `command` with exactly one
+`[[satellite.model]]` and no adapter is a black box; a `command` with no models is cooperative.
+Per-satellite options: `cwd`, `env`, `autostart` (default true; for a black box it means "load at
+startup", through admission), `restart` (`never` | `on-failure` | `always`, exponential backoff
+from `restart_backoff_s`; black boxes are never restarted behind the arbiter's back, they start on
+demand), `health_url`, `start_timeout_s`, `kill_grace_s`, `load_timeout_s`.
+
+Managed processes run in their own session, and every signal goes to the **process group**:
+stopping llama-server's router must stop the per-model children that hold the VRAM, and children
+left behind when a leader exits on its own are terminated too. The daemon stops all managed
+processes on shutdown.
+
+**Pins.** A model is pinned if an operator pinned it (`vrambiter pin`), or, absent an operator
+override, if it was registered pinned or matches the active profile. `vrambiter unpin` overrides
+both. Activating a profile clears operator overrides on the models it names: the most recent
+operator action wins.
+
 CLI:
 
 ```
-vrambiter daemon [--config vrambiter.toml]
+vrambiter daemon [--config vrambiter.toml] [--fake-gpu SIZE]
 vrambiter status [--json]
 vrambiter run --name NAME -- command ...     # launch a satellite with VRAMBITER_SOCKET set
 vrambiter pin|unpin MODEL
 vrambiter evict MODEL
 vrambiter warm MODEL                         # acquire and release: make it resident now
-vrambiter profile NAME
+vrambiter profile NAME | --clear
 ```
+
+## The llama-router adapter
+
+llama-server in router mode lists models (`GET /models`, each with `status.value` in `loaded`,
+`loading`, `unloaded`, `sleeping`, `downloading`, plus `failed`/`exit_code` after a failed load),
+and loads and unloads them asynchronously (`POST /models/load` / `/models/unload` with
+`{"model": id}` return at once; the status changes later). The adapter posts, then polls `/models`
+until the model reaches the wanted state, failing on `failed` or on a load that falls back to
+`unloaded`. Blocking HTTP (stdlib `urllib`) runs in worker threads.
+
+Each loaded model is a child process of the router, so the adapter notes the router's children
+before and after a load and attributes the new ones to the model: its VRAM is their NVML usage,
+exactly. When that is not possible (the arbiter does not run the router, so has no pid; or the
+driver hides per-process numbers) it falls back to the drop in free memory across the load, which
+is right as long as nothing else moved meanwhile (loads are serialised, so usually nothing did).
+Every poll the adapter also lists `/models` and reports loads and unloads the router made on its
+own (autoload for a request, `--sleep-idle-seconds`), which the arbiter then tracks.
+
+Recommended router flags: `--models-max 0` (no router-side LRU; vrambiter decides what to evict)
+and `--no-models-autoload` (a request for an unloaded model fails instead of loading it behind the
+arbiter's back; consumers take a lease, which loads it).
 
 ## Backends (seams for testing)
 
 - `gpu.GpuBackend`: `devices()`, `mem_info(device) -> (free, total)`,
-  `process_usage(device) -> {pid: bytes}`. Implementations: `NvmlBackend` (`nvidia-ml-py`, optional
-  extra) and `FakeGpu` (in-memory, programmable; tests allocate and free "memory" per pid).
-- `host.HostBackend`: `mem_available()`. Implementations: `/proc/meminfo` (Linux), `psutil`
-  fallback, and `FakeHost`.
-- `clock`: injected for timeouts and LRU, so tests run with a fake clock.
+  `process_usage(device) -> {pid: bytes} | None` (`None`: the driver cannot say; `{}`: nobody).
+  Implementations: `NvmlBackend` (`nvidia-ml-py`, optional extra, imported lazily), `FakeGpu`
+  (in-memory, programmable, raises a fake OOM when over-committed; optionally shared between
+  processes through a `flock`ed JSON file, with dead pids reaped as the driver would), and
+  `daemon.SimulatedGpu` (for `--fake-gpu`: usage follows the models' declared sizes).
+- `host.HostBackend`: `mem_available()`, `mem_total()`. Implementations: `/proc/meminfo` (Linux),
+  `psutil` fallback, `UnknownHost` (host-RAM checks skipped), and `FakeHost`.
+  `host.process_tree(pid)` finds a satellite's child processes (psutil, else `/proc`).
+- `clock.Clock`: `now()` and `call_later()`. Every timeout and the poll are timers on the injected
+  clock, so tests run with `FakeClock` and move time explicitly.
 
 ## Package layout
 
@@ -271,36 +432,83 @@ src/vrambiter/
   __init__.py          connect(), public types
   units.py             "17GiB" / "9GB" / ints  <->  bytes
   protocol.py          message dataclasses, NDJSON framing, version
-  errors.py            VramUnavailable, ProtocolError, ...
+  errors.py            VramUnavailable, HostRamUnavailable, ProtocolError, ...
+  clock.py             Clock, LoopClock, FakeClock
   gpu.py               GpuBackend, NvmlBackend, FakeGpu
-  host.py              HostBackend, ProcMeminfo, FakeHost
-  policy.py            plan(): pure admission and victim selection
-  state.py             models, leases, reservations, queue (no I/O)
+  host.py              HostBackend, ProcMeminfo, PsutilHost, FakeHost, process_tree
+  policy.py            plan(), plan_queue(): pure admission and victim selection
+  state.py             models, leases, satellites, settle records, snapshots (no I/O)
   arbiter.py           the daemon core: applies plans, drives evictions, timeouts, events
   server.py            Unix-socket server and connection handling
-  client.py            Arbiter / NullArbiter, Model, leases (sync + async), reconnect
-  managed.py           process supervisor for configured satellites
+  client.py            ArbiterClient / NullArbiter, Model, Lease (sync + async), reconnect
+  managed.py           process supervisor; BlackBoxDriver
   adapters/
     llama_router.py    llama-server router mode
   config.py            TOML config (tomllib; tomli on 3.10)
+  daemon.py            assembles arbiter, server, processes and adapters from a config
+  _http.py             minimal JSON-over-HTTP on urllib
   cli.py               the `vrambiter` command
   integrations/torch.py  unload helpers: drop refs, gc, empty_cache; reserved-bytes measurement
 ```
 
 Python 3.10+. The client (`client.py`, `protocol.py`, `units.py`, `errors.py`) imports nothing outside
-the standard library. The daemon optionally uses `nvidia-ml-py` and `psutil`.
+the standard library; `integrations/torch.py` never imports torch itself. The daemon optionally uses
+`nvidia-ml-py` and `psutil`.
 
 ## Testing
 
 - `policy.py`: table tests for every rule above, plus property tests (Hypothesis): never evict a
-  busy or pinned model; never admit beyond effective free; victims are chosen in
-  (priority, LRU) order; equal inputs give equal plans.
+  busy, pinned, unresponsive or protected model; never admit beyond effective free (alone or summed
+  over a queue pass); victims are the shortest covering prefix in (priority, LRU) order; equal
+  inputs give equal plans whatever order models or requests arrive in; Fail only when nothing in
+  flight could help.
+- `state.py`: reservations (envelope), attribution, settling, snapshot building.
+- The arbiter driven message by message with fake connections and a fake clock (precise timing),
+  and the server with raw NDJSON (malformed input, stale sockets).
 - Arbiter + server + client end to end over a real Unix socket with `FakeGpu` and a fake clock:
-  admission, eviction round trips, refusals, timeouts, disconnect cleanup, queue fairness,
-  host-RAM serialisation, standalone fallback, reconnect.
-- Managed processes: tiny Python scripts as satellites that "allocate" in `FakeGpu` (shared through
-  a file or a socket), killed and restarted by the supervisor.
-- `llama-router` adapter against a fake HTTP server that mimics `/models`, `/models/load` and
-  `/models/unload`.
+  admission, eviction round trips, refusals over the wire, timeouts, disconnect cleanup, queue
+  fairness, host-RAM serialisation, working headroom, standalone fallback, reconnect.
+- A complete daemon from a config with tiny Python scripts as cooperative, black-box and
+  llama-router satellites (the last a faithful fake of router mode, spawning a child per model)
+  sharing a file-backed `FakeGpu`; killed, restarted and evicted by the supervisor.
+- The CLI, including `vrambiter daemon` as a subprocess.
 - On a real GPU (`-m gpu`): a torch satellite allocates tensors, gets evicted, and NVML shows the
   memory returned.
+
+## Changes from the first draft
+
+- **Rule 0 (never fits) was added.** A request larger than `total - headroom` fails at once. The
+  in-process predecessor waited forever for 79 GB of a card that could never offer more than 77.
+- **The host gate is checked before VRAM eviction,** not after it, so models are never evicted for
+  a load that cannot start yet.
+- **Rule 3 (wait for memory already returning)** was added, with **settle records** replacing "wait
+  up to a few seconds after `evicted`": the arbiter keeps planning while memory comes back, but
+  counts it as pending instead of evicting more.
+- **Busy models reserve their working headroom** (`peak - resident`), and reservations are an
+  envelope (`peak - what the process already holds`) rather than the full peak. The draft reserved
+  `vram_peak` only while loading, which left a model that grows during inference unprotected, and
+  double-counted every byte a load had already allocated.
+- **"Could free memory later" includes evicting and protected models and settling memory**, and the
+  queue earmarks room in order. Found by the end-to-end tests: with only busy/loading models
+  counted, a third request behind two that had earmarked an in-flight eviction failed instead of
+  waiting.
+- **Refusal cooldown**: after `evict_refused` a model is not chosen again for 2 s, so a refusal is
+  not followed by an immediate identical eviction.
+- **Only requests older than the measurement are planned** in a pass.
+- **Baselines** (per-satellite CUDA context and allocator floor) are learned when an unload settles,
+  and zero NVML usage for a process with resident models is treated as "cannot see it". Both came
+  from real failure modes: a reconnecting satellite's usage taken as its baseline zeroed its model's
+  size, and a satellite in another PID namespace measured 0 B and so was never evicted.
+- **Protocol additions**: `cancel` (withdraw a queued acquire), `evict_model` and `profile`
+  (operator commands), `hello.role` (`control` connections for the CLI), re-registration fields on
+  `register` with adopted lease ids in `ok.leases`, `notice` kind `lease_lost`, and a list of error
+  codes. All additive; the protocol is still version 1.
+- **Names**: the client classes are `ArbiterClient` and `NullArbiter` (the daemon core is
+  `arbiter.Arbiter`); `clock.py`, `daemon.py` and `_http.py` were added to the layout.
+- **Pins** have explicit precedence (operator override, then declaration or profile; activating a
+  profile clears overrides on the models it names).
+- **`--fake-gpu` simulates usage from declared sizes**, so the daemon can be tried meaningfully on
+  a machine without an NVIDIA GPU.
+- **Black boxes** are exactly one model, never auto-restarted; `autostart` loads them through
+  admission. Signals always go to the process group.
+- **Consumer leases** work for managed (black-box) models as well as adapter-backed ones.
