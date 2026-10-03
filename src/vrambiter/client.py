@@ -241,6 +241,8 @@ class Model(_LeaseOwner):
         self._resident = False
         self.vram_bytes: int | None = None
         self.last_used = 0.0
+        #: The connection epoch on which the arbiter accepted this model's registration.
+        self._registered_epoch = -1
 
     # -- public ---------------------------------------------------------------------------------
 
@@ -705,7 +707,14 @@ class ArbiterClient(_Base):
             )
             self.arbiter_version = getattr(welcome, "arbiter_version", "")
             for model in self.models.values():
-                await self._register_async(model)
+                try:
+                    await self._register_async(model)
+                except ArbiterUnavailable:
+                    raise
+                except VrambiterError as exc:
+                    # One model the new arbiter rejects (a device it does not have, say) must
+                    # not keep the others from coordinating. It stays usable standalone.
+                    log.error("re-registering %s failed: %s", model.name, exc)
         except BaseException:
             writer.close()
             with self._state_lock:
@@ -720,6 +729,7 @@ class ArbiterClient(_Base):
     async def _register_async(self, model: Model) -> None:
         message, held = model._register_message()
         reply = await self._request_async(message)
+        model._registered_epoch = self._epoch
         adopted = list(getattr(reply, "leases", None) or [])
         with model._count_lock:
             still_held = [lease for lease in held if not lease.released]
@@ -871,13 +881,18 @@ class ArbiterClient(_Base):
             return  # registered when the link comes back
         try:
             message, _ = model._register_message()
+            epoch = self._epoch
             self._request(message)
+            model._registered_epoch = epoch
         except ArbiterUnavailable:
             pass  # lost the link meanwhile; the reconnect re-registers it
 
     def _acquire(
         self, model: str, *, wait: bool, timeout: float | None, token: _CancelToken | None
     ) -> _Grant:
+        own = self.models.get(model)
+        if own is not None and own._registered_epoch != self._epoch:
+            return _STANDALONE  # this arbiter does not know the model (rejected or not yet sent)
         message = p.Acquire(model=model, wait=wait, timeout_s=timeout)
         future = self._submit(message)
         if future.done() and isinstance(future.exception(), _ConnectionLost):

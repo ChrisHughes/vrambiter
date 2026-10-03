@@ -354,3 +354,34 @@ async def test_arbiter_restart_client_falls_back_then_reregisters(sock_path):
     finally:
         client.close()
         await d2.stop()
+
+
+async def test_model_rejected_on_reconnect_stays_usable_standalone(sock_path):
+    from vrambiter.gpu import FakeGpu
+
+    d = make_daemon(sock_path)
+    d.gpu = FakeGpu({0: "24GiB", 1: "24GiB"})
+    await d.start()
+    client = await d.client("tts", pid=100)
+    on1 = await asyncio.to_thread(
+        client.register, "second-gpu", vram_peak="1GiB", device=1, load=lambda: None
+    )
+    on0 = await asyncio.to_thread(client.register, "first-gpu", vram_peak="1GiB", load=lambda: None)
+    await d.stop()
+    await wait_for(lambda: not client.connected)
+
+    d2 = make_daemon(sock_path)  # a single-GPU arbiter: device 1 is rejected
+    await d2.start()
+    try:
+        await wait_for(lambda: client.connected, timeout=10)
+        await d2.quiesce()
+        assert d2.model("tts/first-gpu") is not None and d2.model("tts/second-gpu") is None
+        lease = await asyncio.to_thread(on1.acquire)
+        assert lease.standalone
+        lease.release()
+        lease = await asyncio.to_thread(on0.acquire)
+        assert not lease.standalone
+        lease.release()
+    finally:
+        client.close()
+        await d2.stop()
