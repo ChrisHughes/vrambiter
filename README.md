@@ -225,6 +225,30 @@ command = ["/srv/tts/.venv/bin/tts-server", "--port", "8101"]
 
 Sizes accept `GiB`/`MiB` (powers of two) and `GB`/`MB` (powers of ten). Unknown keys are errors.
 
+### One file per application: `conf.d`
+
+An application that shares the GPU should not have to edit the machine's `vrambiter.toml`. It
+ships its own **fragment**, `vrambiter/conf.d/NAME.toml`, under an XDG config directory:
+
+| directory | written by |
+|---|---|
+| `/etc/xdg/vrambiter/conf.d/` (each `$XDG_CONFIG_DIRS` entry) | a package (apt, rpm) |
+| `~/.config/vrambiter/conf.d/` (`$XDG_CONFIG_HOME`) | the user, or an app's setup step |
+
+- A fragment may contain `[[satellite]]` entries and `[profiles.*]` pins. **`[arbiter]` is refused
+  there**: headroom and the socket belong to the machine, not to whichever app was installed last.
+- Fragments are applied in file-name order (`10-llama.toml` before `20-tts.toml`). A file in
+  `~/.config` replaces one of the same name in `/etc/xdg`, so a user can override or mask (with an
+  empty file) what a package installed.
+- A satellite defined twice is an error naming both files. Profiles of the same name merge their
+  pins: two apps can each add to `party`.
+- `vrambiter daemon --check` validates everything and prints which files were loaded, without
+  starting. `--config-dir DIR` (repeatable) or `$VRAMBITER_CONFIG_DIR` replaces the search.
+
+A cooperative satellite that its own service manager starts needs no configuration at all: it
+registers its models over the socket. Fragments are for what the arbiter itself drives: an
+adapter (llama-server), a black box, or a satellite the daemon should start.
+
 ## CLI
 
 | command | |
@@ -242,18 +266,18 @@ or configuration error, 3 no arbiter reachable.
 
 ## Running it as a service
 
-```ini
-# ~/.config/systemd/user/vrambiter.service
-[Unit]
-Description=vrambiter VRAM arbiter
+A systemd user unit ships in [contrib/systemd/vrambiter.service](contrib/systemd/vrambiter.service):
 
-[Service]
-ExecStart=%h/.local/bin/vrambiter daemon --config %h/.config/vrambiter/vrambiter.toml
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
+```sh
+uv tool install 'vrambiter[daemon]'
+cp contrib/systemd/vrambiter.service ~/.config/systemd/user/
+systemctl --user enable --now vrambiter
+loginctl enable-linger "$USER"      # start at boot without a login
 ```
+
+It runs `vrambiter daemon` with the default configuration search (`vrambiter.toml` if present,
+plus `conf.d` fragments). Satellites started as other units of the same user should set
+`After=vrambiter.service` and `Environment=VRAMBITER_SOCKET=%t/vrambiter.sock`.
 
 The socket is created `0600`: whoever can connect can evict models. Set `socket_mode = "0660"` and
 a shared directory to let a group in. Satellites in containers need the host PID namespace

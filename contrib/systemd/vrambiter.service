@@ -1,0 +1,28 @@
+# vrambiter as a systemd USER service, for the user whose processes share the GPU.
+#
+#   uv tool install 'vrambiter[daemon]'        # or: pipx install 'vrambiter[daemon]'
+#   cp contrib/systemd/vrambiter.service ~/.config/systemd/user/
+#   systemctl --user enable --now vrambiter
+#   loginctl enable-linger "$USER"              # start at boot, without a login
+#
+# The socket is $XDG_RUNTIME_DIR/vrambiter.sock (%t below), mode 0600. Satellites run as other
+# units of the same user find it there; give them `After=vrambiter.service` and, to fail loudly
+# rather than run standalone, `Environment=VRAMBITER_SOCKET=%t/vrambiter.sock`.
+#
+# Configuration: ~/.config/vrambiter/vrambiter.toml for the machine's [arbiter] settings (optional),
+# plus one drop-in per application in ~/.config/vrambiter/conf.d/ or /etc/xdg/vrambiter/conf.d/.
+# `vrambiter daemon --check` shows what will be loaded.
+
+[Unit]
+Description=vrambiter: cooperative VRAM arbitration for processes sharing a GPU
+
+[Service]
+ExecStart=%h/.local/bin/vrambiter daemon
+# "Started" only once the socket exists, so `After=vrambiter.service` really means the arbiter is
+# there: a satellite that connects first runs standalone until it restarts.
+ExecStartPost=/bin/sh -c 'for i in $(seq 100); do [ -S "%t/vrambiter.sock" ] && exit 0; sleep 0.1; done; echo "no socket at %t/vrambiter.sock" >&2; exit 1'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

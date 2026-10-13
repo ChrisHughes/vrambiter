@@ -119,6 +119,24 @@ of), the mapping is direct:
 Job scheduling (one heavy job at a time, a GPU slot) stays the server's business: vrambiter only
 answers "is there room for this model, and if not whose idle weights can go".
 
+### Keep vrambiter optional
+
+Users of your server should not need vrambiter. Two layers make it optional:
+
+- **No daemon**: `vrambiter.connect()` returns a `NullArbiter` whose leases load on first use and
+  never unload. The server behaves as a standalone one would.
+- **Not installed**: import it optionally, and fall back to whatever the server did before.
+
+```python
+try:
+    import vrambiter
+except ImportError:          # not installed: the server's own memory handling stands alone
+    vrambiter = None
+```
+
+`connect(required=True)` is for the opposite case: a deployment that expects the daemon and would
+rather fail at start than run standalone without noticing.
+
 ### Several models in one process
 
 Works as is. The client reports each model's growth of `torch.cuda.memory_reserved()` across its
@@ -201,6 +219,9 @@ command = ["/opt/llama.cpp/build/bin/llama-server", "--models-preset", "/etc/lla
   router_model = "qwen3-8b"     # when vrambiter's name differs from the router's id
   vram_peak = "9GiB"
 ```
+
+Ship this as your deployment's own fragment (`~/.config/vrambiter/conf.d/llama.toml`, see the
+README's `conf.d`), not as an edit to the machine's `vrambiter.toml`.
 
 Only declared models are managed; others the router lists (cache entries, duplicates) are ignored
 (their memory still counts against free memory). `vram_peak` for a GGUF model is roughly the file
