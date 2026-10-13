@@ -1,6 +1,6 @@
 """The ``vrambiter`` command.
 
-    vrambiter daemon [--config vrambiter.toml]
+    vrambiter daemon [--config vrambiter.toml] [--config-dir DIR ...] [--check]
     vrambiter status [--json]
     vrambiter run --name NAME -- command ...     # launch a satellite with VRAMBITER_SOCKET set
     vrambiter pin|unpin MODEL
@@ -28,7 +28,7 @@ from .client import ArbiterClient, default_socket_path
 from .errors import ArbiterUnavailable, VrambiterError
 from .units import format_bytes, parse_bytes
 
-__all__ = ["main", "render_status"]
+__all__ = ["main", "render_config", "render_status"]
 
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_UNAVAILABLE = 0, 1, 2, 3
 
@@ -62,6 +62,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         default=None,
         help="vrambiter.toml (default: $VRAMBITER_CONFIG, ~/.config/vrambiter/vrambiter.toml)",
+    )
+    d.add_argument(
+        "--config-dir",
+        action="append",
+        metavar="DIR",
+        help="drop-in fragment directory, repeatable, least important first (default: "
+        "$VRAMBITER_CONFIG_DIR, else vrambiter/conf.d under $XDG_CONFIG_DIRS and $XDG_CONFIG_HOME)",
+    )
+    d.add_argument(
+        "--check",
+        action="store_true",
+        help="validate the configuration and its fragments, print what would run, and exit",
     )
     d.add_argument(
         "--fake-gpu",
@@ -122,15 +134,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _daemon(args: argparse.Namespace) -> int:
-    from .config import Config, ConfigError, load_config
+    from .config import (
+        Config,
+        ConfigError,
+        apply_fragments,
+        find_fragments,
+        fragment_dirs,
+        load_config,
+    )
     from .daemon import run_daemon
 
     path = args.config or _default_config()
+    dirs = [Path(d) for d in args.config_dir] if args.config_dir else fragment_dirs()
     try:
         config = load_config(path) if path else Config()
+        apply_fragments(config, find_fragments(dirs))
     except ConfigError as exc:
         print(f"vrambiter: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    if args.check:
+        print(render_config(config, dirs))
+        return EXIT_OK
     if args.socket:
         config.socket = args.socket
     if args.fake_gpu:
@@ -140,6 +164,9 @@ def _daemon(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+    logging.getLogger("vrambiter").info(
+        "config: %s; fragments: %s", config.source, ", ".join(config.fragments) or "none"
     )
     from .gpu import GpuBackendError
 
@@ -228,6 +255,24 @@ def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
     for row in rows:
         lines.append("  ".join(c.ljust(w) for c, w in zip(row, widths, strict=True)).rstrip())
     return lines
+
+
+def render_config(config: Any, dirs: Sequence[Path]) -> str:
+    """What `daemon --check` prints: where the configuration came from and what it declares."""
+    lines = [f"config:    {config.source}"]
+    lines.append("searched:  " + (", ".join(str(d) for d in dirs) or "(none)"))
+    lines.append("fragments: " + (", ".join(config.fragments) or "(none)"))
+    if not config.satellites:
+        lines.append("satellites: (none configured; cooperative satellites may still connect)")
+    for sat in config.satellites:
+        models = ", ".join(
+            m.name + (" (pinned)" if m.pinned else "") + f" {format_bytes(m.vram_peak)}"
+            for m in sat.models
+        )
+        lines.append(f"  {sat.name:<16} {sat.kind.value:<12} {models}")
+    for name, pins in sorted(config.settings.profiles.items()):
+        lines.append(f"profile {name}: pins " + (", ".join(pins) or "(nothing)"))
+    return "\n".join(lines)
 
 
 def render_status(status: dict[str, Any]) -> str:

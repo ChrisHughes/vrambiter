@@ -14,12 +14,21 @@ Satellite kinds are inferred from what the entry declares:
 * ``command`` and no models: a **cooperative** satellite that registers its own models over the
   socket. The arbiter starts it with ``VRAMBITER_SOCKET`` and ``VRAMBITER_NAME`` set and restarts
   it according to ``restart``.
+
+**Fragments.** Beside the machine's own ``vrambiter.toml``, each application can ship its part of
+the configuration as a drop-in file, ``vrambiter/conf.d/NAME.toml``, under any XDG config directory
+(``/etc/xdg`` for a package, ``~/.config`` for the user). A fragment may add ``[[satellite]]``
+entries and ``[profiles.*]`` pins; ``[arbiter]`` settings belong to the machine and are refused in a
+fragment. A fragment in a more important directory replaces one of the same file name in a less
+important one, so a user can override or mask what a package installed. Satellite names must be
+unique across every file; profiles of the same name merge their pins.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -42,7 +51,13 @@ __all__ = [
     "RestartPolicy",
     "load_config",
     "parse_config",
+    "fragment_dirs",
+    "find_fragments",
+    "apply_fragments",
 ]
+
+#: Drop-in directory name, under ``<XDG config dir>/vrambiter/``.
+FRAGMENT_DIR = "conf.d"
 
 ADAPTERS = ("llama-router",)
 
@@ -124,18 +139,91 @@ class Config:
     gpu: str = "nvml"
     fake_vram: int = 24 * 1024**3
     source: str = "<defaults>"
+    #: Drop-in files merged in by :func:`apply_fragments`, in the order applied.
+    fragments: list[str] = field(default_factory=list)
+
+
+def _read_toml(p: Path) -> dict[str, Any]:
+    try:
+        return tomllib.loads(p.read_text())
+    except FileNotFoundError:
+        raise ConfigError(f"{p}: no such file") from None
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{p}: invalid TOML: {exc}") from None
 
 
 def load_config(path: str | os.PathLike[str]) -> Config:
     """Read and validate a TOML file."""
     p = Path(path)
-    try:
-        data = tomllib.loads(p.read_text())
-    except FileNotFoundError:
-        raise ConfigError(f"{p}: no such file") from None
-    except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"{p}: invalid TOML: {exc}") from None
-    return parse_config(data, source=str(p))
+    return parse_config(_read_toml(p), source=str(p))
+
+
+def fragment_dirs() -> list[Path]:
+    """Drop-in directories, least important first.
+
+    ``$VRAMBITER_CONFIG_DIR`` (``os.pathsep``-separated) replaces the search. Otherwise every
+    ``$XDG_CONFIG_DIRS`` entry (default ``/etc/xdg``, where a package installs) and then
+    ``$XDG_CONFIG_HOME`` (default ``~/.config``), each with ``vrambiter/conf.d`` appended.
+    """
+    explicit = os.environ.get("VRAMBITER_CONFIG_DIR")
+    if explicit:
+        return [Path(d) for d in explicit.split(os.pathsep) if d]
+    system = os.environ.get("XDG_CONFIG_DIRS") or "/etc/xdg"
+    user = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    # XDG lists the most important system directory first; this list runs least important first.
+    bases = [d for d in system.split(os.pathsep) if d][::-1] + [user]
+    return [Path(b) / "vrambiter" / FRAGMENT_DIR for b in bases]
+
+
+def find_fragments(dirs: Sequence[str | os.PathLike[str]]) -> list[Path]:
+    """The ``*.toml`` files in ``dirs``, ordered by file name.
+
+    ``dirs`` runs least important first: a file in a later directory replaces one of the same name
+    in an earlier one. Missing directories are skipped.
+    """
+    chosen: dict[str, Path] = {}
+    for d in map(Path, dirs):
+        if not d.is_dir():
+            continue
+        for f in d.glob("*.toml"):
+            if f.is_file():
+                chosen[f.name] = f
+    return [chosen[name] for name in sorted(chosen)]
+
+
+def apply_fragments(config: Config, paths: Sequence[str | os.PathLike[str]]) -> Config:
+    """Merge drop-in fragments into ``config`` (in place) and return it.
+
+    A fragment adds satellites and profile pins. ``[arbiter]`` is refused: the machine's settings
+    have one owner, its ``vrambiter.toml``. A satellite defined twice is an error naming both files.
+    """
+    defined_in = {sat.name: config.source for sat in config.satellites}
+    for path in map(Path, paths):
+        data = _read_toml(path)
+        if "arbiter" in data:
+            raise ConfigError(
+                f"{path}: [arbiter] settings belong in the machine's vrambiter.toml; a fragment "
+                "may only add [[satellite]] entries and [profiles.*] pins"
+            )
+        try:
+            fragment = parse_config(data, source=str(path))
+        except ConfigError as exc:
+            message = str(exc)
+            raise ConfigError(
+                message if message.startswith(str(path)) else f"{path}: {message}"
+            ) from None
+        for sat in fragment.satellites:
+            if sat.name in defined_in:
+                raise ConfigError(
+                    f"{path}: satellite {sat.name!r} is already defined in {defined_in[sat.name]}"
+                )
+            defined_in[sat.name] = str(path)
+            config.satellites.append(sat)
+        for name, pins in fragment.settings.profiles.items():
+            merged = config.settings.profiles.setdefault(name, [])
+            merged.extend(pin for pin in pins if pin not in merged)
+        config.fragments.append(str(path))
+    return config
 
 
 class _Table:

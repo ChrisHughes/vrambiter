@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import os
 import textwrap
 
 import pytest
 
 from vrambiter.config import (
+    Config,
     ConfigError,
     RestartPolicy,
     SatelliteKind,
+    apply_fragments,
+    find_fragments,
+    fragment_dirs,
     load_config,
     parse_config,
 )
@@ -205,3 +210,120 @@ def test_file_errors(tmp_path):
     bad.write_text("[arbiter\n")
     with pytest.raises(ConfigError, match="invalid TOML"):
         load_config(bad)
+
+
+# --- drop-in fragments -------------------------------------------------------------------------
+
+LLAMA_FRAGMENT = textwrap.dedent(
+    """
+    [[satellite]]
+    name = "llama"
+    adapter = "llama-router"
+    url = "http://127.0.0.1:8000"
+
+      [[satellite.model]]
+      name = "qwen"
+      vram_peak = "40GiB"
+      pinned = true
+
+    [profiles.party]
+    pin = ["llama/qwen", "tts/*"]
+    """
+)
+
+DIFFUSION_FRAGMENT = textwrap.dedent(
+    """
+    [profiles.party]
+    pin = ["tts/*", "diffusion/sdxl"]
+    """
+)
+
+
+def write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def test_fragments_add_satellites_and_merge_profile_pins(tmp_path):
+    main = load_config(write(tmp_path / "vrambiter.toml", '[arbiter]\nheadroom = "3GiB"\n'))
+    d = tmp_path / "conf.d"
+    write(d / "20-diffusion.toml", DIFFUSION_FRAGMENT)
+    write(d / "10-llama.toml", LLAMA_FRAGMENT)
+
+    config = apply_fragments(main, find_fragments([d]))
+
+    assert config.settings.headroom == 3 * GiB  # the machine's settings stand
+    assert [s.name for s in config.satellites] == ["llama"]
+    assert config.satellites[0].models[0].pinned
+    # Same-named profiles merge, keeping order and dropping repeats.
+    assert config.settings.profiles["party"] == ["llama/qwen", "tts/*", "diffusion/sdxl"]
+    assert [p.split("/")[-1] for p in config.fragments] == ["10-llama.toml", "20-diffusion.toml"]
+
+
+def test_fragments_without_a_main_file(tmp_path):
+    d = tmp_path / "conf.d"
+    write(d / "llama.toml", LLAMA_FRAGMENT)
+    config = apply_fragments(Config(), find_fragments([d]))
+    assert [s.name for s in config.satellites] == ["llama"]
+
+
+def test_a_fragment_may_not_set_arbiter_settings(tmp_path):
+    frag = write(tmp_path / "conf.d" / "greedy.toml", '[arbiter]\nheadroom = "0GiB"\n')
+    with pytest.raises(ConfigError, match=r"greedy\.toml: \[arbiter\] settings belong"):
+        apply_fragments(Config(), [frag])
+
+
+def test_a_satellite_defined_twice_names_both_files(tmp_path):
+    main = load_config(write(tmp_path / "vrambiter.toml", LLAMA_FRAGMENT))
+    frag = write(tmp_path / "conf.d" / "again.toml", LLAMA_FRAGMENT)
+    with pytest.raises(ConfigError) as exc:
+        apply_fragments(main, [frag])
+    message = str(exc.value)
+    assert "again.toml" in message and "vrambiter.toml" in message and "'llama'" in message
+
+
+def test_fragment_errors_name_the_file_and_location(tmp_path):
+    bad = LLAMA_FRAGMENT.replace('vram_peak = "40GiB"', 'vram_peek = "40GiB"')
+    frag = write(tmp_path / "conf.d" / "typo.toml", bad)
+    with pytest.raises(ConfigError, match=r"typo\.toml: satellite\[0\]\.model\[0\].*vram_pe"):
+        apply_fragments(Config(), [frag])
+
+
+def test_a_more_important_directory_replaces_a_fragment_of_the_same_name(tmp_path):
+    system, user = tmp_path / "etc", tmp_path / "home"
+    write(system / "llama.toml", LLAMA_FRAGMENT)
+    write(system / "only-system.toml", DIFFUSION_FRAGMENT)
+    write(user / "llama.toml", "# masked by the user\n")
+    found = find_fragments([system, user])
+    assert [(p.parent.name, p.name) for p in found] == [
+        ("home", "llama.toml"),
+        ("etc", "only-system.toml"),
+    ]
+    assert apply_fragments(Config(), found).satellites == []
+
+
+def test_find_fragments_skips_missing_dirs_and_other_files(tmp_path):
+    d = tmp_path / "conf.d"
+    write(d / "a.toml", DIFFUSION_FRAGMENT)
+    write(d / "README", "not config")
+    write(d / "b.toml.disabled", LLAMA_FRAGMENT)
+    assert [p.name for p in find_fragments([tmp_path / "missing", d])] == ["a.toml"]
+
+
+def test_fragment_dirs_follow_xdg(monkeypatch):
+    monkeypatch.delenv("VRAMBITER_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_DIRS", "/etc/first:/etc/second")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/home/u/.config")
+    assert [str(d) for d in fragment_dirs()] == [
+        "/etc/second/vrambiter/conf.d",  # least important first
+        "/etc/first/vrambiter/conf.d",
+        "/home/u/.config/vrambiter/conf.d",  # the user's own wins
+    ]
+    monkeypatch.delenv("XDG_CONFIG_DIRS")
+    assert str(fragment_dirs()[0]) == "/etc/xdg/vrambiter/conf.d"
+
+
+def test_vrambiter_config_dir_replaces_the_search(monkeypatch):
+    monkeypatch.setenv("VRAMBITER_CONFIG_DIR", f"/a{os.pathsep}/b")
+    assert [str(d) for d in fragment_dirs()] == ["/a", "/b"]

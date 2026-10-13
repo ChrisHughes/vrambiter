@@ -277,3 +277,27 @@ def test_render_status_covers_every_section():
         "RESIDUE",
     ):
         assert fragment in text, fragment
+
+
+def test_daemon_check_reports_fragments_without_starting(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("VRAMBITER_CONFIG", raising=False)
+    conf_d = tmp_path / "conf.d"
+    conf_d.mkdir()
+    (conf_d / "llama.toml").write_text(
+        '[[satellite]]\nname = "llama"\nadapter = "llama-router"\nurl = "http://127.0.0.1:8000"\n'
+        '[[satellite.model]]\nname = "qwen"\nvram_peak = "40GiB"\npinned = true\n'
+        '[profiles.party]\npin = ["llama/qwen"]\n'
+    )
+    assert main(["daemon", "--config-dir", str(conf_d), "--check"]) == 0
+    out = capsys.readouterr().out
+    assert "llama.toml" in out
+    assert "qwen (pinned)" in out
+    assert "profile party: pins llama/qwen" in out
+
+
+def test_daemon_check_fails_on_a_bad_fragment(tmp_path, capsys):
+    conf_d = tmp_path / "conf.d"
+    conf_d.mkdir()
+    (conf_d / "bad.toml").write_text('[arbiter]\nheadroom = "1GiB"\n')
+    assert main(["daemon", "--config-dir", str(conf_d), "--check"]) == 2
+    assert "bad.toml" in capsys.readouterr().err
