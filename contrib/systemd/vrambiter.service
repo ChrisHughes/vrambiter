@@ -18,6 +18,9 @@ Description=vrambiter: cooperative VRAM arbitration for processes sharing a GPU
 
 [Service]
 ExecStart=%h/.local/bin/vrambiter daemon
+# "Started" only once the socket exists, so `After=vrambiter.service` really means the arbiter is
+# there: a satellite that connects first runs standalone until it restarts.
+ExecStartPost=/bin/sh -c 'for i in $(seq 100); do [ -S "%t/vrambiter.sock" ] && exit 0; sleep 0.1; done; echo "no socket at %t/vrambiter.sock" >&2; exit 1'
 Restart=on-failure
 RestartSec=2
 
