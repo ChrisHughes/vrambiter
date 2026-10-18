@@ -233,6 +233,7 @@ class Model(_LeaseOwner):
         pinned: bool,
         device: int,
         load: LoadFn,
+        vram_work: int | None = None,
         unload: LoadFn | None,
         measure: MeasureFn | None,
         cleanup: bool,
@@ -241,6 +242,7 @@ class Model(_LeaseOwner):
         self.name = name
         self.vram_peak = vram_peak
         self.vram_resident = vram_resident
+        self.vram_work = vram_work
         self.host_peak = host_peak
         self.priority = priority
         self.pinned = pinned
@@ -485,6 +487,7 @@ class Model(_LeaseOwner):
                 model=self.name,
                 vram_peak=self.vram_peak,
                 vram_resident=self.vram_resident,
+                vram_work=self.vram_work,
                 host_peak=self.host_peak,
                 priority=self.priority,
                 pinned=self.pinned,
@@ -561,11 +564,14 @@ class _Base:
         device: int = 0,
         measure: MeasureFn | None = None,
         cleanup: bool = True,
+        vram_work: int | str | None = None,
     ) -> Model:
         """Declare a model this satellite can load.
 
         ``vram_peak`` is the most VRAM the model needs while loading *or working* (admission
-        reserves it); ``vram_resident`` what it holds while idle (optional, measured anyway);
+        reserves it); ``vram_work`` (optional) the most it needs while working once resident, when
+        that is less (a load with a transient spike: a lease then reserves ``vram_work``, not the
+        spike); ``vram_resident`` what it holds while idle (optional, measured anyway);
         ``host_peak`` the host RAM a load needs. Sizes accept ints (bytes) or strings like
         ``"9GiB"``. ``load()`` makes the model resident; ``unload()`` drops it (after which, with
         ``cleanup=True``, the library runs ``gc.collect()`` and ``torch.cuda.empty_cache()`` if
@@ -580,6 +586,7 @@ class _Base:
             name,
             vram_peak=parse_bytes(vram_peak),
             vram_resident=parse_optional_bytes(vram_resident),
+            vram_work=parse_optional_bytes(vram_work),
             host_peak=parse_bytes(host_peak),
             priority=int(priority),
             pinned=bool(pinned),

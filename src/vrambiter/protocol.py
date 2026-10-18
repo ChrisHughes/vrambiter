@@ -158,6 +158,10 @@ class Register(Message):
     model as the satellite currently holds it, so a satellite re-registering after an arbiter
     restart is believed rather than reset: a model that is resident and leased stays resident and
     busy, and a load still running keeps its reservation.
+
+    ``vram_work`` (optional) is the most the model holds while working once resident, when that is
+    less than ``vram_peak`` (a load with a transient spike); an arbiter that predates it ignores
+    it and reserves ``vram_peak`` for leases, as before.
     """
 
     type: ClassVar[str] = "register"
@@ -165,6 +169,7 @@ class Register(Message):
     vram_peak: int
     device: int = 0
     vram_resident: int | None = None
+    vram_work: int | None = None
     host_peak: int = 0
     priority: int = 0
     pinned: bool = False

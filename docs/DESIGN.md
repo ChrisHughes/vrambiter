@@ -102,6 +102,7 @@ Each model declares:
 | field | meaning |
 |---|---|
 | `vram_peak` | VRAM needed while loading or working. Admission reserves this. |
+| `vram_work` | VRAM needed while working once resident, when less than `vram_peak` (a load with a transient spike). Optional; a lease on a resident model reserves up to this instead of `vram_peak`. |
 | `vram_resident` | VRAM held while idle-resident. Optional; refined by measurement. |
 | `host_peak` | host RAM needed during load. Optional; default 0. |
 | `priority` | integer, default 0. Higher priority may evict lower; equal priority evicts by LRU. |
@@ -255,7 +256,7 @@ arbiter can send unsolicited messages (`evict`, `notice`) at any time. Lines are
 ```
 client -> arbiter                                 arbiter -> client
 hello    {name, pid, version, protocol, role}  ->   welcome {satellite, protocol, arbiter_version}
-register {model, device, vram_peak, vram_resident?, host_peak, priority, pinned,
+register {model, device, vram_peak, vram_resident?, vram_work?, host_peak, priority, pinned,
           state, vram_bytes?, leases}          ->   ok {model, leases?} | error
 acquire  {model, wait, timeout_s?}             ->   granted {lease, action: "load"|"ready", model}
                                                     | error
@@ -550,6 +551,13 @@ the standard library; `integrations/torch.py` never imports torch itself. The da
 - **Rule 3 (wait for memory already returning)** was added, with **settle records** replacing "wait
   up to a few seconds after `evicted`": the arbiter keeps planning while memory comes back, but
   counts it as pending instead of evicting more.
+- **A daemon that starts before the driver's GPUs are up finds them later.** NVML can initialise
+  at boot and count no device; the backend now looks again (a fresh NVML session every 5 s) while
+  it has none. Before, the arbiter ran with no GPU and refused every registration until restarted.
+- **A load's transient can be declared apart from the work** (`vram_work`, added later): a model
+  whose warmup spikes far above its working set no longer reserves the spike for every lease.
+  Undeclared, it is `vram_peak`, so older satellites and arbiters behave as before (an arbiter
+  that predates the field ignores it, as it ignores any unknown field).
 - **Busy models reserve their working headroom** (`peak - resident`), and reservations are an
   envelope (`peak - what the process already holds`) rather than the full peak. The draft reserved
   `vram_peak` only while loading, which left a model that grows during inference unprotected, and

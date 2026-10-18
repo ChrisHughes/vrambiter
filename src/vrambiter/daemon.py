@@ -62,12 +62,12 @@ class SimulatedGpu:
         for model in list(self.registry.models.values()):
             if model.phase is Phase.UNLOADED:
                 continue
-            busy = model.phase is Phase.LOADING or bool(model.leases)
-            nbytes = (
-                model.vram_peak
-                if busy
-                else (model.vram_resident or model.reported_bytes or model.vram_peak)
-            )
+            if model.phase is Phase.LOADING:
+                nbytes = model.vram_peak
+            elif model.leases:
+                nbytes = model.work_peak()
+            else:
+                nbytes = model.vram_resident or model.reported_bytes or model.vram_peak
             sat = self.registry.satellites.get(model.satellite)
             pid = next(iter(model.pids), None) or (sat.pid if sat else None)
             if pid:

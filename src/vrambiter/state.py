@@ -7,7 +7,10 @@ Nothing here does I/O or reads a clock: times are passed in. ``arbiter.py`` owns
 
 THREE NUMBERS PER MODEL, because a declared size is a peak and not a residency:
 
-* ``vram_peak`` (declared) is what admission reserves for a load or a working lease.
+* ``vram_peak`` (declared) is what admission reserves for a load, and for a working lease unless
+  ``vram_work`` says less. ``vram_work`` (declared, optional) is the most a resident model holds
+  while working: a model whose load has a transient (CUDA graph capture, a warmup) far above
+  anything it needs afterwards declares both, so a lease does not reserve the load's spike.
 * ``vram_resident`` (declared, optional) is what the model is expected to hold while idle.
 * ``measured_bytes`` is what the driver says it actually holds while idle, attributed from NVML
   per-process usage (and refined by the satellite's own report). It wins whenever it exists.
@@ -62,6 +65,7 @@ class ModelRecord:
     vram_peak: int
     device: int = 0
     vram_resident: int | None = None
+    vram_work: int | None = None
     host_peak: int = 0
     priority: int = 0
     declared_pinned: bool = False
@@ -123,9 +127,13 @@ class ModelRecord:
                 return value
         return self.vram_peak
 
+    def work_peak(self) -> int:
+        """The most this model holds while working once resident (``vram_work``, else the peak)."""
+        return self.vram_peak if self.vram_work is None else self.vram_work
+
     def working_headroom(self) -> int:
         """How much more than its idle size a lease may make this model hold."""
-        return max(0, self.vram_peak - self.resident_estimate())
+        return max(0, self.work_peak() - self.resident_estimate())
 
     def view(self, now: float = 0.0) -> ModelView:
         return ModelView(
@@ -327,7 +335,7 @@ def satellite_reservation(
             outstanding += m.vram_peak
         elif m.phase in (Phase.RESIDENT, Phase.EVICTING):
             if m.leases:
-                envelope += max(m.vram_peak, m.resident_estimate())
+                envelope += max(m.work_peak(), m.resident_estimate())
                 outstanding += m.working_headroom()
             else:
                 envelope += m.resident_estimate()

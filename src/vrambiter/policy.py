@@ -158,8 +158,9 @@ class Snapshot:
 class Request:
     """One admission question.
 
-    ``need`` is the VRAM to find: ``vram_peak`` for a load, ``vram_peak - resident`` (the working
-    headroom) for a lease on an idle resident model, 0 for another lease on a busy one.
+    ``need`` is the VRAM to find: ``vram_peak`` for a load, ``vram_work - resident`` (the working
+    headroom; ``vram_work`` defaults to ``vram_peak``) for a lease on an idle resident model, 0 for
+    another lease on a busy one.
     """
 
     model_id: str

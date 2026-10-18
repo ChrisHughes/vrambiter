@@ -115,6 +115,7 @@ class ModelSpec:
     name: str
     vram_peak: int
     vram_resident: int | None = None
+    vram_work: int | None = None
     host_peak: int = 0
     priority: int = 0
     pinned: bool = False
@@ -299,6 +300,7 @@ class Arbiter:
                 vram_peak=spec.vram_peak,
                 device=spec.device,
                 vram_resident=spec.vram_resident,
+                vram_work=spec.vram_work,
                 host_peak=spec.host_peak,
                 priority=spec.priority,
                 declared_pinned=spec.pinned,
@@ -443,6 +445,17 @@ class Arbiter:
                 f"vram_resident ({format_bytes(msg.vram_resident)}) exceeds vram_peak "
                 f"({format_bytes(msg.vram_peak)}): a peak is the most a model ever holds"
             )
+        if msg.vram_work is not None:
+            if msg.vram_work < 0 or msg.vram_work > msg.vram_peak:
+                raise RegistrationError(
+                    f"vram_work ({format_bytes(msg.vram_work)}) must be from 0 to vram_peak "
+                    f"({format_bytes(msg.vram_peak)}): a peak is the most a model ever holds"
+                )
+            if msg.vram_resident is not None and msg.vram_resident > msg.vram_work:
+                raise RegistrationError(
+                    f"vram_resident ({format_bytes(msg.vram_resident)}) exceeds vram_work "
+                    f"({format_bytes(msg.vram_work)}): working never holds less than idle"
+                )
         if self._last is not None and msg.device not in self._last.gpu.total:
             raise RegistrationError(
                 f"no GPU {msg.device} (devices: {sorted(self._last.gpu.total)})"
@@ -464,6 +477,7 @@ class Arbiter:
             self.registry.models[model_id] = model
         model.vram_peak = msg.vram_peak
         model.vram_resident = msg.vram_resident
+        model.vram_work = msg.vram_work
         model.host_peak = msg.host_peak
         model.priority = msg.priority
         model.declared_pinned = msg.pinned
@@ -1472,6 +1486,7 @@ class Arbiter:
                     "pinned": model.pinned,
                     "priority": model.priority,
                     "vram_peak": model.vram_peak,
+                    "vram_work": model.vram_work,
                     "vram_resident": model.vram_resident,
                     "reported": model.reported_bytes,
                     "measured": model.measured_bytes,

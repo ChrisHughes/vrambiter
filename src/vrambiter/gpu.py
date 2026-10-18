@@ -26,14 +26,18 @@ import contextlib
 import errno
 import fcntl
 import json
+import logging
 import os
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from .units import GiB, format_bytes, parse_bytes
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "GpuBackend",
@@ -121,6 +125,11 @@ def take_snapshot(backend: GpuBackend) -> GpuSnapshot:
 class NvmlBackend:
     """Real measurements through NVML (``pip install vrambiter[daemon]``)."""
 
+    #: With no devices, NVML is asked again this often. A daemon started at boot can come up before
+    #: the driver has brought its GPUs up: NVML then initialises but counts none, and without
+    #: another look the arbiter would refuse every model until someone restarted it.
+    REPROBE_S = 5.0
+
     def __init__(self) -> None:
         try:
             import pynvml  # provided by the nvidia-ml-py distribution
@@ -131,14 +140,38 @@ class NvmlBackend:
         self._nvml = pynvml
         try:
             pynvml.nvmlInit()
-            count = pynvml.nvmlDeviceGetCount()
-            self._handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
+            self._handles = self._enumerate()
         except pynvml.NVMLError as exc:  # pragma: no cover - needs a broken driver
             raise GpuBackendError(f"NVML initialisation failed: {exc}") from exc
         self._closed = False
+        self._next_probe = time.monotonic() + self.REPROBE_S
+        if not self._handles:
+            log.warning("NVML sees no GPU yet; looking again every %.0f s", self.REPROBE_S)
+
+    def _enumerate(self) -> list[Any]:
+        nvml = self._nvml
+        return [nvml.nvmlDeviceGetHandleByIndex(i) for i in range(nvml.nvmlDeviceGetCount())]
 
     def devices(self) -> list[int]:
+        if not self._handles and not self._closed and time.monotonic() >= self._next_probe:
+            self._next_probe = time.monotonic() + self.REPROBE_S
+            self._reprobe()
         return list(range(len(self._handles)))
+
+    def _reprobe(self) -> None:
+        """Count the devices again in a fresh NVML session (one started before a device was up
+        does not see it later)."""
+        nvml = self._nvml
+        with contextlib.suppress(nvml.NVMLError):
+            nvml.nvmlShutdown()
+        try:
+            nvml.nvmlInit()
+            self._handles = self._enumerate()
+        except nvml.NVMLError as exc:
+            log.debug("NVML still sees no GPU: %s", exc)
+            return
+        if self._handles:
+            log.info("NVML now sees %d GPU(s)", len(self._handles))
 
     def mem_info(self, device: int) -> tuple[int, int]:
         try:
