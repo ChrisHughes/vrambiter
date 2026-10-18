@@ -83,6 +83,7 @@ class ModelConfig:
     name: str
     vram_peak: int
     vram_resident: int | None = None
+    vram_work: int | None = None
     host_peak: int = 0
     priority: int = 0
     pinned: bool = False
@@ -95,6 +96,7 @@ class ModelConfig:
             name=self.name,
             vram_peak=self.vram_peak,
             vram_resident=self.vram_resident,
+            vram_work=self.vram_work,
             host_peak=self.host_peak,
             priority=self.priority,
             pinned=self.pinned,
@@ -412,6 +414,7 @@ def _parse_satellite(t: _Table) -> SatelliteConfig:
             name=m.get_str("name", required=True),
             vram_peak=m.get_size("vram_peak", required=True),
             vram_resident=m.get_size("vram_resident"),
+            vram_work=m.get_size("vram_work"),
             host_peak=m.get_size("host_peak", 0),
             priority=m.get_int("priority", 0),
             pinned=m.get_bool("pinned", False),
@@ -421,6 +424,14 @@ def _parse_satellite(t: _Table) -> SatelliteConfig:
         m.done()
         if model.vram_resident is not None and model.vram_resident > model.vram_peak:
             raise ConfigError(f"{m.where}.vram_resident: exceeds vram_peak")
+        if model.vram_work is not None and model.vram_work > model.vram_peak:
+            raise ConfigError(f"{m.where}.vram_work: exceeds vram_peak")
+        if (
+            model.vram_work is not None
+            and model.vram_resident is not None
+            and model.vram_resident > model.vram_work
+        ):
+            raise ConfigError(f"{m.where}.vram_resident: exceeds vram_work")
         if model.name in model_names:
             raise ConfigError(f"{m.where}.name: duplicate model {model.name!r}")
         if model.router_model and sat.adapter != "llama-router":

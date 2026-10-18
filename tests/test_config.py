@@ -91,6 +91,7 @@ def test_black_box_and_options():
                             "name": "sdxl",
                             "vram_peak": "17GiB",
                             "vram_resident": "8GiB",
+                            "vram_work": "9GiB",
                             "host_peak": "14GiB",
                             "priority": 2,
                             "pinned": True,
@@ -104,6 +105,7 @@ def test_black_box_and_options():
     (sat,) = config.satellites
     assert sat.kind is SatelliteKind.BLACK_BOX and sat.restart is RestartPolicy.NEVER
     spec = sat.models[0].spec()
+    assert spec.vram_work == 9 * GiB
     assert (spec.vram_peak, spec.vram_resident, spec.host_peak, spec.priority, spec.pinned) == (
         17 * GiB,
         8 * GiB,
@@ -178,6 +180,37 @@ def test_black_box_and_options():
                 ]
             },
             "exceeds vram_peak",
+        ),
+        (
+            {
+                "satellite": [
+                    {
+                        "name": "a",
+                        "command": ["x"],
+                        "model": [{"name": "m", "vram_peak": "1GiB", "vram_work": "2GiB"}],
+                    }
+                ]
+            },
+            "vram_work: exceeds vram_peak",
+        ),
+        (
+            {
+                "satellite": [
+                    {
+                        "name": "a",
+                        "command": ["x"],
+                        "model": [
+                            {
+                                "name": "m",
+                                "vram_peak": "4GiB",
+                                "vram_work": "2GiB",
+                                "vram_resident": "3GiB",
+                            }
+                        ],
+                    }
+                ]
+            },
+            "vram_resident: exceeds vram_work",
         ),
         (
             {

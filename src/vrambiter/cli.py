@@ -311,7 +311,8 @@ def render_status(status: dict[str, Any]) -> str:
                     state,
                     str(m.get("leases", 0)),
                     format_bytes(holds) if holds is not None and m["state"] != "unloaded" else "-",
-                    format_bytes(m.get("vram_peak")),
+                    format_bytes(m.get("vram_peak"))
+                    + (f" (work {format_bytes(m['vram_work'])})" if m.get("vram_work") else ""),
                     str(m.get("priority", 0)),
                     "yes" if m.get("pinned") else "",
                     _duration(m.get("idle_s"))

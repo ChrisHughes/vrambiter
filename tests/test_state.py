@@ -108,6 +108,21 @@ def test_reservation_for_busy_model_is_its_working_headroom():
     assert satellite_reservation([busy], None) == 10 * GiB
 
 
+def test_a_working_peak_bounds_a_lease_but_not_a_load():
+    """A load that spikes (CUDA graph capture) far above what the model works in: the load still
+    reserves the spike, a lease on the resident model only ``vram_work`` minus what it holds."""
+    m = model(peak=38, resident=19, vram_work=22 * GiB)
+    assert request_for(m).need == 38 * GiB
+    m.phase = Phase.RESIDENT
+    assert m.work_peak() == 22 * GiB and m.working_headroom() == 3 * GiB
+    assert request_for(m).need == 3 * GiB
+    m.leases = {"L1"}
+    assert satellite_reservation([m], 19 * GiB) == 3 * GiB
+    loading = model("l", peak=38, phase=Phase.LOADING, leases=1, vram_work=22 * GiB)
+    assert satellite_reservation([loading], 0) == 38 * GiB
+    assert model(peak=38, resident=19).work_peak() == 38 * GiB  # undeclared: the peak, as before
+
+
 def test_reservation_without_usage_reserves_full_outstanding():
     loading = model("b", peak=10, phase=Phase.LOADING, leases=1)
     idle = model("a", peak=10, resident=8, phase=Phase.RESIDENT)

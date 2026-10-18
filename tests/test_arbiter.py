@@ -176,6 +176,8 @@ async def test_name_free_again_after_disconnect(arb, gpu):
     ("kwargs", "fragment"),
     [
         (dict(model="m", vram_peak=10, vram_resident=11), "exceeds vram_peak"),
+        (dict(model="m", vram_peak=10, vram_work=11), "vram_work"),
+        (dict(model="m", vram_peak=10, vram_resident=6, vram_work=5), "exceeds vram_work"),
         (dict(model="m", vram_peak=10, device=3), "no GPU 3"),
         (dict(model="m", vram_peak=-1), ">= 0"),
         (dict(model="m", vram_peak=1, state="sideways"), "state must be"),
@@ -212,6 +214,20 @@ async def test_acquire_load_then_concurrent_lease_gets_ready(arb, gpu):
     assert g2.action == "ready"
     third = sat.acquire("voice")
     assert (await granted(arb, sat, third)).action == "ready"  # busy: immediate
+
+
+@pytest.mark.parametrize(("work", "admitted"), [(12, True), (None, False)])
+async def test_a_lease_on_a_resident_model_reserves_its_working_peak(arb, gpu, work, admitted):
+    """Loaded at 10 GiB after a 20 GiB load spike, with 3 GiB left on the card: a model that works
+    in 12 GiB gets its lease; one that declared only the peak still waits for 10 GiB."""
+    tts = Sat(arb, gpu, "tts", 100)
+    kw = {} if work is None else {"vram_work": int(work * GiB)}
+    await resident(arb, tts, "voice", 10, peak=20, **kw)
+    gpu.allocate(999, int(11 * GiB))  # someone else's: 3 GiB free
+    rid = tts.acquire("voice", wait=False)
+    await arb.quiesce()
+    assert isinstance(tts.reply(rid), p.Granted) is admitted, tts.reply(rid)
+    assert arb.status()["models"][0]["vram_work"] == (None if work is None else work * GiB)
 
 
 async def test_unknown_model_and_consumer_lease_on_cooperative(arb, gpu):

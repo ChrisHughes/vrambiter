@@ -135,6 +135,15 @@ async def test_register_errors_surface(daemon):
     assert "bad" not in client.models
 
 
+async def test_register_declares_a_working_peak(daemon):
+    client = await daemon.client("tts", pid=100)
+    await asyncio.to_thread(
+        client.register, "voice", vram_peak="38GiB", vram_work="22GiB", load=lambda: None
+    )
+    assert daemon.model("tts/voice").vram_work == 22 * GiB
+    assert daemon.model("tts/voice").vram_peak == 38 * GiB
+
+
 async def test_eviction_unloads_and_next_lease_reloads(daemon):
     a = await daemon.client("a", pid=100)
     b = await daemon.client("b", pid=200)

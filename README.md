@@ -129,7 +129,10 @@ its 17 GiB peak while it works.)
 measures what each model really holds (NVML per-process usage, refined by the satellite's own
 `torch.cuda.memory_reserved()` report) and uses that to decide what an eviction frees. While a
 model is leased, the gap between its peak and what it holds stays reserved, so a model that grows
-during inference never meets a neighbour that was admitted into its room.
+during inference never meets a neighbour that was admitted into its room. A model whose *load*
+spikes far above anything it needs afterwards (CUDA graph capture, a warmup pass) also declares
+`vram_work`, the most it holds while working once resident: the load still reserves `vram_peak`,
+a lease only the gap up to `vram_work`.
 
 **Admission.** A request is admitted if `free - reserved - headroom` covers it. Otherwise the
 arbiter evicts idle, unpinned models of equal or lower priority, lowest priority first and then
@@ -167,7 +170,8 @@ daemon that is still starting.
 ```python
 arb = vrambiter.connect(name, socket=None, required=False, wait_s=0.0)
 model = arb.register(name, vram_peak=..., load=..., unload=None, vram_resident=None,
-                     host_peak=0, priority=0, pinned=False, device=0, measure=None, cleanup=True)
+                     host_peak=0, priority=0, pinned=False, device=0, measure=None, cleanup=True,
+                     vram_work=None)
 
 with model.lease(timeout=None, wait=True, on_wait=None) as lease: ...   # sync
 async with model.alease(timeout=None, wait=True): ...       # asyncio

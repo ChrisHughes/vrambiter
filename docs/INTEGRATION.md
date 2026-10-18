@@ -26,6 +26,7 @@ Declare numbers you measured, rounded up, through the real server path:
 |---|---|
 | `vram_peak` | driver-level peak (`torch.cuda.mem_get_info()` sampled during a cold load *followed by one inference*, or `nvidia-smi --query-gpu=memory.used -lms 20`). The peak covers loading **and working**. |
 | `vram_resident` | the same reading once the model sits idle after a job (optional: vrambiter measures it). |
+| `vram_work` | optional: the driver-level peak of the longest job on the *resident* model, sampled finely (a 10 ms NVML sampler). Declare it only when the load's peak is far above it (a warmup that captures CUDA graphs); it must lie between `vram_resident` and `vram_peak`. |
 | `host_peak` | peak RSS of the process during a cold load (`/usr/bin/time -v`, `psutil`). |
 
 Use driver-level numbers, not `torch.cuda.max_memory_allocated()`: the allocator's view misses the
@@ -36,7 +37,10 @@ admitted into the room it needed. Too high, and the arbiter evicts models it did
 or, once nothing is left to evict, fails a request that would have run. While a model is leased,
 `vram_peak - resident` stays reserved, so the activations of a warm inference are protected without
 any extra declaration: a model with a 17 GB cold peak that sits at 7.2 GB reserves 9.8 GB while it
-works.
+works. When the cold peak is a transient of the load alone (Breeze TTS captures CUDA graphs at
++37 GB for under 100 ms, then works in about 19 GB), that reservation would be the spike, not the
+work, and a neighbour could leave too little room for a line that needs almost nothing extra:
+declare `vram_work` and a lease reserves `vram_work - resident` instead.
 
 ### Write `load` and `unload`
 
