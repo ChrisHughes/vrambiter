@@ -130,6 +130,28 @@ def test_nvml_backend_reports_unknown_usage(monkeypatch):
     assert NvmlBackend().process_usage(0) == {}
 
 
+def test_nvml_backend_finds_gpus_that_come_up_after_it_started(monkeypatch):
+    """At boot the daemon can start before the driver has its GPUs up: NVML initialises but counts
+    none. The backend looks again, in a fresh NVML session, until they appear."""
+    _fake_pynvml(monkeypatch, compute=[], graphics=[])
+    mod = sys.modules["pynvml"]
+    count, calls = {"n": 0}, []
+    mod.nvmlDeviceGetCount = lambda: count["n"]
+    mod.nvmlInit = lambda: calls.append("init")
+    mod.nvmlShutdown = lambda: calls.append("shutdown")
+    monkeypatch.setattr(NvmlBackend, "REPROBE_S", 3600.0)
+    slow = NvmlBackend()
+    assert slow.devices() == [] and calls == ["init"]  # not before the interval
+    monkeypatch.setattr(NvmlBackend, "REPROBE_S", 0.0)
+    nvml = NvmlBackend()
+    assert nvml.devices() == []
+    count["n"] = 1
+    assert nvml.devices() == [0]
+    assert calls[-2:] == ["shutdown", "init"]
+    seen = len(calls)
+    assert nvml.devices() == [0] and len(calls) == seen  # found: no more probing
+
+
 def test_snapshot_never_counts_an_allocation_as_free_and_used():
     """An allocation landing between the free and per-process reads must not inflate free."""
 
