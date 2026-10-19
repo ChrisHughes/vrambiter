@@ -31,6 +31,8 @@ from .units import format_bytes, parse_bytes
 __all__ = ["main", "render_config", "render_status"]
 
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_UNAVAILABLE = 0, 1, 2, 3
+# Seconds into a shutdown before every thread's stack is dumped (systemd kills at 90).
+STUCK_STOP_DUMP_S = 10.0
 
 
 def _default_config() -> str | None:
@@ -168,10 +170,13 @@ def _daemon(args: argparse.Namespace) -> int:
     logging.getLogger("vrambiter").info(
         "config: %s; fragments: %s", config.source, ", ".join(config.fragments) or "none"
     )
+    import faulthandler
+
     from .gpu import GpuBackendError
 
     try:
-        asyncio.run(run_daemon(config))
+        asyncio.run(run_daemon(config, dump_stuck_stop_s=STUCK_STOP_DUMP_S))
+        faulthandler.cancel_dump_traceback_later()
     except GpuBackendError as exc:
         print(f"vrambiter: {exc}", file=sys.stderr)
         return EXIT_USAGE

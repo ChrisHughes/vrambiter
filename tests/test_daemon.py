@@ -354,3 +354,21 @@ async def test_llama_router_dead_instance_is_unloaded_and_reloaded(make, gpu):
 
     assert await asyncio.to_thread(chat) == "ready"
     assert gemma.pids and child not in gemma.pids
+
+
+async def test_a_stop_arms_a_stack_dump_in_case_it_hangs(sock_path, monkeypatch):
+    """A stop that hangs where nothing logs is killed by systemd after 90 s with no clue why:
+    the daemon arms faulthandler to dump every thread's stack if it is still alive by then."""
+    import faulthandler
+
+    from vrambiter.daemon import run_daemon
+
+    armed = []
+    monkeypatch.setattr(faulthandler, "dump_traceback_later", lambda t, exit=False: armed.append(t))
+    config = parse_config({"arbiter": {"socket": sock_path, "gpu": "fake", "fake_vram": "24GiB"}})
+    stop = asyncio.Event()
+    stop.set()
+    await run_daemon(config, stop=stop, dump_stuck_stop_s=10.0)
+    assert armed == [10.0]
+    await run_daemon(config, stop=stop)  # in-process callers (tests) are not armed by default
+    assert armed == [10.0]
