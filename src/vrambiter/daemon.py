@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import faulthandler
 import logging
 import signal
 from collections.abc import Callable
@@ -204,8 +205,16 @@ class Daemon:
             self.gpu.close()
 
 
-async def run_daemon(config: Config, *, stop: asyncio.Event | None = None) -> None:
-    """Run until SIGTERM/SIGINT (or ``stop`` is set), then shut down cleanly."""
+async def run_daemon(
+    config: Config, *, stop: asyncio.Event | None = None, dump_stuck_stop_s: float | None = None
+) -> None:
+    """Run until SIGTERM/SIGINT (or ``stop`` is set), then shut down cleanly.
+
+    ``dump_stuck_stop_s``: if the process is still alive that long after shutdown begins, write
+    every thread's stack to stderr. A stop can hang where nothing logs (a worker thread blocked
+    in a driver keeps ``asyncio.run`` from returning), and systemd then kills it silently after
+    90 s; the caller cancels the dump once the loop has really finished.
+    """
     stop = stop or asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -223,4 +232,6 @@ async def run_daemon(config: Config, *, stop: asyncio.Event | None = None) -> No
         await stop.wait()
     finally:
         log.info("shutting down")
+        if dump_stuck_stop_s:
+            faulthandler.dump_traceback_later(dump_stuck_stop_s, exit=False)
         await daemon.stop()
